@@ -1,0 +1,23 @@
+{
+  "name": "telecentaur",
+  "version": "1.0.0",
+  "description": "Claude-powered Telegram bot with Quidli Connect integration",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "@animocabrands/minds-client-lib": "latest",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@google/genai": "^0.7.0",
+    "dotenv": "^16.0.0",
+    "openai": "^4.0.0",
+    "telegraf": "^4.16.3",
+    "viem": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
