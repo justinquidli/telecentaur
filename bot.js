@@ -15,7 +15,7 @@ import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
 import { DatabaseSync } from 'node:sqlite';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { createMindsClient } from '@animocabrands/minds-client-lib';
+import { createMindsClient, isReplyHistoryRow } from '@animocabrands/minds-client-lib';
 import { createWalletClient, http, encodeFunctionData } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
@@ -337,13 +337,6 @@ function getOpenAIHistory(contextId) {
   return openaiHistories.get(contextId);
 }
 
-// ─── Minds handoff state ──────────────────────────────────────────────────────
-
-const mindsLastResponse = new Map();
-
-function mindsStateKey(contextId, senderId) {
-  return `${contextId}:${senderId}`;
-}
 
 function stripHtml(text) {
   return text.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
@@ -1142,7 +1135,7 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
 
 // ─── Minds background handler ─────────────────────────────────────────────────
 
-async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderId, stateKey, mindName) {
+async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderId, mindName) {
   const creds = getUserMindsCredentials(senderId);
   if (!creds) {
     await tg.telegram.editMessageText(chatId, pendingMsgId, null,
@@ -1180,10 +1173,6 @@ async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderI
       responseText = '⏳ Your Mind is taking longer than expected. Try again.';
     } else {
       responseText = stripHtml(outcome.reply?.messageText || '(no response)');
-      mindsLastResponse.set(stateKey, {
-        text: responseText,
-        isPendingAction: looksLikePendingAction(responseText),
-      });
     }
 
     const finalText = `${responseText}\n— Minds (${mindName})`;
@@ -1481,7 +1470,7 @@ tg.on(messageFilter('text'), async (ctx) => {
 
   try {
     // Resolve which LLM key to use: user's own key takes priority over host key
-    const effectiveProvider = userLlmKey ? userLlmKey.provider : provider;
+    const effectiveProvider = (provider !== 'minds' && userLlmKey) ? userLlmKey.provider : provider;
     const effectiveLlmKey = userLlmKey?.apiKey ?? null;
 
     if (effectiveProvider === 'gemini') {
@@ -1493,21 +1482,40 @@ tg.on(messageFilter('text'), async (ctx) => {
     } else if (effectiveProvider === 'minds') {
       const creds = getUserMindsCredentials(senderId);
       const mindName = creds?.name ?? 'unknown';
-      const stateKey = mindsStateKey(contextId, senderId);
-      const lastState = mindsLastResponse.get(stateKey);
 
-      if (lastState?.isPendingAction && isPositiveConfirmation(cleanText)) {
-        mindsLastResponse.delete(stateKey);
-        const handoffText =
-          `${timeContext}\n${senderContext} ${walletNote}\n` +
-          `The user's Minds AI agent researched and prepared the following action plan. ` +
-          `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
-          `---\n${lastState.text}\n---\n\n` +
-          `User confirmed: "${cleanText}"`;
+      // If this looks like a confirmation, re-fetch Minds history to check for a pending action.
+      // Using getHistory instead of in-memory state so handoffs survive bot restarts.
+      let handoffText = null;
+      if (creds && isPositiveConfirmation(cleanText)) {
+        try {
+          const mindsClient = createMindsClient({ builderApiKey: creds.apiKey });
+          const history = await mindsClient.getHistory(creds.alias, { limit: 10 });
+          const lastMindReply = history.findLast((row) => isReplyHistoryRow(row));
+          if (lastMindReply) {
+            const age = Date.now() - new Date(lastMindReply.createdAt).getTime();
+            const pendingText = stripHtml(lastMindReply.messageText ?? '');
+            if (age < 60 * 60 * 1000 && looksLikePendingAction(pendingText)) {
+              handoffText =
+                `${timeContext}\n${senderContext} ${walletNote}\n` +
+                `The user's Minds AI agent researched and prepared the following action plan. ` +
+                `The user has now confirmed it. Execute it immediately using your tools — no further confirmation needed:\n\n` +
+                `---\n${pendingText}\n---\n\n` +
+                `User confirmed: "${cleanText}"`;
+            }
+          }
+        } catch (err) {
+          console.error('[minds-history] error:', err.message);
+          await bot.telegram.editMessageText(chatId, pendingMsg.message_id, undefined,
+            '⚠️ Could not verify pending action — please try again.').catch(() => {});
+          return;
+        }
+      }
+
+      if (handoffText) {
         accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, effectiveLlmKey);
         modelLabel = `${CLAUDE_MODEL} (via Minds)`;
       } else {
-        runMindsBackground(contextId, contextualText, chatId, pendingMsg.message_id, senderId, stateKey, mindName)
+        runMindsBackground(contextId, contextualText, chatId, pendingMsg.message_id, senderId, mindName)
           .catch((err) => console.error('[minds-bg] unhandled:', err.message));
         return;
       }
