@@ -1385,14 +1385,24 @@ tg.on(messageFilter('text'), async (ctx) => {
   // Owner check — used for BYOLLM exemption and wallet note below
   const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
 
+  // Peek at provider intent before BYOLLM check — Minds doesn't need an LLM key
+  const cleanTextPeek = botUsername
+    ? text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim()
+    : text.trim();
+  const switchPeek = detectProviderSwitch(cleanTextPeek);
+  const isMindsContext = switchPeek === 'minds' || getChannelProvider(String(chatId)) === 'minds';
+
   // BYOLLM enforcement — if host requires users to bring their own key (owner is always exempt)
-  if (REQUIRE_USER_LLM && !isOwner && !getUserLlmKey(senderId)) {
+  // Minds users bypass this — they authenticate via Minds credentials, not LLM keys
+  if (REQUIRE_USER_LLM && !isOwner && !isMindsContext && !getUserLlmKey(senderId)) {
     await ctx.reply(
       'This bot requires you to connect your own AI API key.\n\n' +
       'DM me to set it up:\n' +
       '/llm anthropic <key> — from console.anthropic.com\n' +
       '/llm gemini <key> — from aistudio.google.com/apikey\n' +
-      '/llm openai <key> — from platform.openai.com'
+      '/llm openai <key> — from platform.openai.com\n\n' +
+      'Or use Minds — connect your Minds AI agent:\n' +
+      '/minds <alias> <builderApiKey>'
     ).catch(() => {});
     return;
   }
