@@ -190,8 +190,11 @@ db.exec(`CREATE TABLE IF NOT EXISTS user_keys (
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_alias TEXT`); } catch { }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_api_key TEXT`); } catch { }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_name TEXT`); } catch { }
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_mind_id TEXT`); } catch { }
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN minds_alias_created_at INTEGER`); } catch { }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_provider TEXT`); } catch { }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_api_key TEXT`); } catch { }
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_model TEXT`); } catch { }
 
 db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
   id         TEXT PRIMARY KEY,
@@ -246,37 +249,48 @@ function deleteUserApiKey(telegramId) {
 }
 
 function getUserMindsCredentials(telegramId) {
-  const row = db.prepare('SELECT minds_alias, minds_api_key, minds_name FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
+  const row = db.prepare('SELECT minds_alias, minds_api_key, minds_name, minds_mind_id, minds_alias_created_at FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
   if (!row?.minds_alias || !row?.minds_api_key) return null;
-  return { alias: row.minds_alias, apiKey: decrypt(row.minds_api_key), name: row.minds_name ?? 'Minds' };
+  return {
+    alias: row.minds_alias,
+    apiKey: decrypt(row.minds_api_key),
+    name: row.minds_name ?? 'Minds',
+    mindId: row.minds_mind_id ?? null,
+    aliasCreatedAt: row.minds_alias_created_at ?? null,
+  };
 }
 
-function setUserMindsCredentials(telegramId, apiKey, alias, mindName) {
-  db.prepare(`INSERT INTO user_keys (telegram_id, minds_alias, minds_api_key, minds_name)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(telegram_id) DO UPDATE SET minds_alias = excluded.minds_alias, minds_api_key = excluded.minds_api_key, minds_name = excluded.minds_name`)
-    .run(String(telegramId), alias, encrypt(apiKey), mindName ?? null);
+function setUserMindsCredentials(telegramId, apiKey, alias, mindName, mindId) {
+  db.prepare(`INSERT INTO user_keys (telegram_id, minds_alias, minds_api_key, minds_name, minds_mind_id, minds_alias_created_at)
+    VALUES (?, ?, ?, ?, ?, unixepoch())
+    ON CONFLICT(telegram_id) DO UPDATE SET
+      minds_alias = excluded.minds_alias,
+      minds_api_key = excluded.minds_api_key,
+      minds_name = excluded.minds_name,
+      minds_mind_id = excluded.minds_mind_id,
+      minds_alias_created_at = excluded.minds_alias_created_at`)
+    .run(String(telegramId), alias, encrypt(apiKey), mindName ?? null, mindId ?? null);
 }
 
 function deleteUserMindsCredentials(telegramId) {
-  db.prepare('UPDATE user_keys SET minds_alias = NULL, minds_api_key = NULL, minds_name = NULL WHERE telegram_id = ?').run(String(telegramId));
+  db.prepare('UPDATE user_keys SET minds_alias = NULL, minds_api_key = NULL, minds_name = NULL, minds_mind_id = NULL, minds_alias_created_at = NULL WHERE telegram_id = ?').run(String(telegramId));
 }
 
 function getUserLlmKey(telegramId) {
-  const row = db.prepare('SELECT llm_provider, llm_api_key FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
+  const row = db.prepare('SELECT llm_provider, llm_api_key, llm_model FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
   if (!row?.llm_provider || !row?.llm_api_key) return null;
-  return { provider: row.llm_provider, apiKey: decrypt(row.llm_api_key) };
+  return { provider: row.llm_provider, apiKey: decrypt(row.llm_api_key), model: row.llm_model ?? null };
 }
 
-function setUserLlmKey(telegramId, provider, apiKey) {
-  db.prepare(`INSERT INTO user_keys (telegram_id, llm_provider, llm_api_key)
-    VALUES (?, ?, ?)
-    ON CONFLICT(telegram_id) DO UPDATE SET llm_provider = excluded.llm_provider, llm_api_key = excluded.llm_api_key`)
-    .run(String(telegramId), provider, encrypt(apiKey));
+function setUserLlmKey(telegramId, provider, apiKey, model) {
+  db.prepare(`INSERT INTO user_keys (telegram_id, llm_provider, llm_api_key, llm_model)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(telegram_id) DO UPDATE SET llm_provider = excluded.llm_provider, llm_api_key = excluded.llm_api_key, llm_model = excluded.llm_model`)
+    .run(String(telegramId), provider, encrypt(apiKey), model ?? null);
 }
 
 function deleteUserLlmKey(telegramId) {
-  db.prepare('UPDATE user_keys SET llm_provider = NULL, llm_api_key = NULL WHERE telegram_id = ?').run(String(telegramId));
+  db.prepare('UPDATE user_keys SET llm_provider = NULL, llm_api_key = NULL, llm_model = NULL WHERE telegram_id = ?').run(String(telegramId));
 }
 
 function recordChatMember(chatId, userId, username) {
@@ -921,11 +935,11 @@ async function getGeminiClient(userApiKey) {
   return new GoogleGenAI({ apiKey: key });
 }
 
-async function getOpenAIClient(userApiKey) {
+async function getOpenAIClient(userApiKey, baseURL) {
   const key = userApiKey || OPENAI_API_KEY;
   if (!key) throw new Error('No OpenAI API key available. DM me /llm openai <key> to connect your own.');
   const { default: OpenAI } = await import('openai');
-  return new OpenAI({ apiKey: key });
+  return new OpenAI({ apiKey: key, ...(baseURL ? { baseURL } : {}) });
 }
 
 function getGeminiTools() {
@@ -1096,15 +1110,16 @@ async function runGeminiLoop(contextId, contextualText, editor, toolCtx, userLlm
   return accumulated;
 }
 
-async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlmKey) {
-  const openai = await getOpenAIClient(userLlmKey);
+async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlmKey, { baseURL, model } = {}) {
+  const openai = await getOpenAIClient(userLlmKey, baseURL);
+  const modelToUse = model || OPENAI_MODEL;
   const history = getOpenAIHistory(contextId);
   history.push({ role: 'user', content: contextualText });
   let messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history];
   let accumulated = '';
 
   while (true) {
-    const response = await openai.chat.completions.create({ model: OPENAI_MODEL, messages, tools: getOpenAITools(), tool_choice: 'auto' });
+    const response = await openai.chat.completions.create({ model: modelToUse, messages, tools: getOpenAITools(), tool_choice: 'auto' });
     const choice = response.choices[0];
     const msg = choice.message;
 
@@ -1135,13 +1150,33 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
 
 // ─── Minds background handler ─────────────────────────────────────────────────
 
+const MINDS_ALIAS_MAX_AGE_S = 4 * 60 * 60; // rotate conversation thread every 4 hours
+
 async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderId, mindName) {
-  const creds = getUserMindsCredentials(senderId);
+  let creds = getUserMindsCredentials(senderId);
   if (!creds) {
     await tg.telegram.editMessageText(chatId, pendingMsgId, null,
       '⚠️ You need to connect your Minds agent.\nDM me /minds <builder-api-key> to connect.\nGet a Builder API key at https://build.hellominds.ai/console'
     ).catch(() => {});
     return;
+  }
+
+  // Rotate alias if older than 4 hours to prevent Minds falling back to email
+  if (creds.mindId && creds.aliasCreatedAt) {
+    const ageS = Math.floor(Date.now() / 1000) - creds.aliasCreatedAt;
+    if (ageS > MINDS_ALIAS_MAX_AGE_S) {
+      try {
+        const rotateClient = createMindsClient({ builderApiKey: creds.apiKey });
+        const newAlias = `tc${String(senderId).slice(-8)}${randomBytes(2).toString('hex')}`;
+        await rotateClient.ensureConversation(newAlias, creds.mindId);
+        setUserMindsCredentials(senderId, creds.apiKey, newAlias, creds.name, creds.mindId);
+        creds = getUserMindsCredentials(senderId);
+        console.log(`[minds] Rotated alias for ${senderId} → ${newAlias}`);
+      } catch (err) {
+        console.error('[minds-rotate] failed:', err.message);
+        // Continue with old alias rather than failing
+      }
+    }
   }
 
   const { alias, apiKey } = creds;
@@ -1290,7 +1325,7 @@ tg.command('minds', async (ctx) => {
 
     const userAlias = `tc${String(ctx.from.id).slice(-8)}${randomBytes(2).toString('hex')}`;
     await client.ensureConversation(userAlias, selectedMind.mindId);
-    setUserMindsCredentials(ctx.from.id, apiKey, userAlias, selectedMind.name);
+    setUserMindsCredentials(ctx.from.id, apiKey, userAlias, selectedMind.name, selectedMind.mindId);
 
     const otherMinds = enabledMinds.filter((m) => m.mindId !== selectedMind.mindId);
     const switchHint = otherMinds.length > 0
@@ -1314,26 +1349,32 @@ tg.command('llm', async (ctx) => {
   const parts = ctx.message.text.replace('/llm', '').trim().split(/\s+/);
   const provider = parts[0]?.toLowerCase();
   const apiKey = parts[1];
+  const model = parts[2] || null; // optional, only used for openrouter
 
   if (!provider || !apiKey) {
     return ctx.reply(
       'Usage: /llm <provider> <api-key>\n\n' +
       'Providers:\n' +
-      '  anthropic — from console.anthropic.com\n' +
-      '  gemini    — from aistudio.google.com/apikey\n' +
-      '  openai    — from platform.openai.com\n\n' +
-      'Example: /llm anthropic sk-ant-...\n\n' +
+      '  anthropic  — from console.anthropic.com\n' +
+      '  gemini     — from aistudio.google.com/apikey\n' +
+      '  openai     — from platform.openai.com\n' +
+      '  openrouter — from openrouter.ai (access 100+ models)\n\n' +
+      'For OpenRouter, you can optionally specify a model:\n' +
+      '  /llm openrouter <key> [model]\n' +
+      '  Example: /llm openrouter sk-or-... meta-llama/llama-3-70b-instruct\n' +
+      '  Default model: openai/gpt-4o\n\n' +
       'Your key is stored encrypted and used instead of the host key. DM /llm_remove to disconnect.'
     );
   }
 
-  if (!['anthropic', 'gemini', 'openai'].includes(provider)) {
-    return ctx.reply('Unknown provider. Use: anthropic, gemini, or openai');
+  if (!['anthropic', 'gemini', 'openai', 'openrouter'].includes(provider)) {
+    return ctx.reply('Unknown provider. Use: anthropic, gemini, openai, or openrouter');
   }
 
-  setUserLlmKey(ctx.from.id, provider, apiKey);
+  setUserLlmKey(ctx.from.id, provider, apiKey, model);
+  const modelNote = provider === 'openrouter' ? ` (model: ${model || 'openai/gpt-4o'})` : '';
   ctx.reply(
-    `✅ Connected your ${provider} key. Your messages will now use your own ${provider} credits.\n\n` +
+    `✅ Connected your ${provider} key${modelNote}. Your messages will now use your own ${provider} credits.\n\n` +
     '⚠️ Your key is stored encrypted. DM /llm_remove anytime to disconnect.'
   );
 });
@@ -1482,6 +1523,7 @@ tg.on(messageFilter('text'), async (ctx) => {
     // Resolve which LLM key to use: user's own key takes priority over host key
     const effectiveProvider = (provider !== 'minds' && userLlmKey) ? userLlmKey.provider : provider;
     const effectiveLlmKey = userLlmKey?.apiKey ?? null;
+    const effectiveModel = userLlmKey?.model ?? null;
 
     if (effectiveProvider === 'gemini') {
       accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
@@ -1489,6 +1531,13 @@ tg.on(messageFilter('text'), async (ctx) => {
     } else if (effectiveProvider === 'openai') {
       accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
       modelLabel = OPENAI_MODEL;
+    } else if (effectiveProvider === 'openrouter') {
+      const orModel = effectiveModel || 'openai/gpt-4o';
+      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey, {
+        baseURL: 'https://openrouter.ai/api/v1',
+        model: orModel,
+      });
+      modelLabel = orModel;
     } else if (effectiveProvider === 'minds') {
       const creds = getUserMindsCredentials(senderId);
       const mindName = creds?.name ?? 'unknown';
