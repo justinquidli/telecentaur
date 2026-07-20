@@ -196,6 +196,19 @@ try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_provider TEXT`); } catch { }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_api_key TEXT`); } catch { }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN llm_model TEXT`); } catch { }
 
+// Per-provider LLM keys — a user can store anthropic, gemini, openai, and openrouter keys side by side
+db.exec(`CREATE TABLE IF NOT EXISTS user_llm_keys (
+  user_id  TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  api_key  TEXT NOT NULL,
+  model    TEXT,
+  PRIMARY KEY (user_id, provider)
+)`);
+// One-time migration from the legacy single-key columns (idempotent)
+db.exec(`INSERT OR IGNORE INTO user_llm_keys (user_id, provider, api_key, model)
+  SELECT telegram_id, llm_provider, llm_api_key, llm_model FROM user_keys
+  WHERE llm_provider IS NOT NULL AND llm_api_key IS NOT NULL`);
+
 db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
   id         TEXT PRIMARY KEY,
   sender_id  TEXT NOT NULL,
@@ -276,20 +289,34 @@ function deleteUserMindsCredentials(telegramId) {
   db.prepare('UPDATE user_keys SET minds_alias = NULL, minds_api_key = NULL, minds_name = NULL, minds_mind_id = NULL, minds_alias_created_at = NULL WHERE telegram_id = ?').run(String(telegramId));
 }
 
-function getUserLlmKey(telegramId) {
-  const row = db.prepare('SELECT llm_provider, llm_api_key, llm_model FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
-  if (!row?.llm_provider || !row?.llm_api_key) return null;
-  return { provider: row.llm_provider, apiKey: decrypt(row.llm_api_key), model: row.llm_model ?? null };
+function getUserLlmKeyFor(telegramId, provider) {
+  const row = db.prepare('SELECT api_key, model FROM user_llm_keys WHERE user_id = ? AND provider = ?').get(String(telegramId), provider);
+  if (!row?.api_key) return null;
+  return { provider, apiKey: decrypt(row.api_key), model: row.model ?? null };
+}
+
+function hasAnyUserLlmKey(telegramId) {
+  return !!db.prepare('SELECT 1 FROM user_llm_keys WHERE user_id = ? LIMIT 1').get(String(telegramId));
 }
 
 function setUserLlmKey(telegramId, provider, apiKey, model) {
-  db.prepare(`INSERT INTO user_keys (telegram_id, llm_provider, llm_api_key, llm_model)
+  db.prepare(`INSERT INTO user_llm_keys (user_id, provider, api_key, model)
     VALUES (?, ?, ?, ?)
-    ON CONFLICT(telegram_id) DO UPDATE SET llm_provider = excluded.llm_provider, llm_api_key = excluded.llm_api_key, llm_model = excluded.llm_model`)
+    ON CONFLICT(user_id, provider) DO UPDATE SET api_key = excluded.api_key, model = COALESCE(excluded.model, user_llm_keys.model)`)
     .run(String(telegramId), provider, encrypt(apiKey), model ?? null);
 }
 
-function deleteUserLlmKey(telegramId) {
+function setUserLlmModel(telegramId, provider, model) {
+  db.prepare('UPDATE user_llm_keys SET model = ? WHERE user_id = ? AND provider = ?').run(model, String(telegramId), provider);
+}
+
+function deleteUserLlmKey(telegramId, provider) {
+  if (provider) {
+    db.prepare('DELETE FROM user_llm_keys WHERE user_id = ? AND provider = ?').run(String(telegramId), provider);
+  } else {
+    db.prepare('DELETE FROM user_llm_keys WHERE user_id = ?').run(String(telegramId));
+  }
+  // Clear legacy columns so the migration doesn't resurrect removed keys
   db.prepare('UPDATE user_keys SET llm_provider = NULL, llm_api_key = NULL, llm_model = NULL WHERE telegram_id = ?').run(String(telegramId));
 }
 
@@ -323,11 +350,33 @@ function detectProviderSwitch(text) {
   if (/(switch|change|use|swap)\s+(to\s+)?(gemini|google)/.test(lower)) return 'gemini';
   if (/(switch|change|use|swap)\s+(to\s+)?(openai|gpt|chatgpt|open\s*ai)/.test(lower)) return 'openai';
   if (/(switch|change|use|swap)\s+(to\s+)?(claude|anthropic)/.test(lower)) return 'anthropic';
+  if (/(switch|change|use|swap)\s+(to\s+)?(openrouter|open\s*router|kimi|llama|mistral|deepseek)/.test(lower)) return 'openrouter';
   if (/\bgemini\s+mode\b/.test(lower)) return 'gemini';
   if (/\bopenai\s+mode\b/.test(lower)) return 'openai';
   if (/\bclaude\s+mode\b/.test(lower)) return 'anthropic';
+  if (/\b(openrouter|kimi|llama|mistral|deepseek)\s+mode\b/.test(lower)) return 'openrouter';
   if (/(switch|change|use|swap)\s+(to\s+)?minds/.test(lower)) return 'minds';
   if (/\bminds\s+mode\b/.test(lower)) return 'minds';
+  return null;
+}
+
+// Map friendly model names to OpenRouter slugs. Named model in a switch phrase
+// (e.g. "switch to kimi") sets the user's OpenRouter model too.
+const OPENROUTER_MODEL_ALIASES = {
+  kimi: 'moonshotai/kimi-k2.6',
+  llama: 'meta-llama/llama-3.3-70b-instruct',
+  deepseek: 'deepseek/deepseek-chat',
+  mistral: 'mistralai/mistral-large',
+};
+
+// Claude via OpenRouter for BYOLLM users who only have an OpenRouter key
+const OPENROUTER_CLAUDE_SLUG = 'anthropic/claude-sonnet-4.6';
+
+function detectOpenRouterModel(text) {
+  const lower = text.toLowerCase();
+  for (const [alias, slug] of Object.entries(OPENROUTER_MODEL_ALIASES)) {
+    if (lower.includes(alias)) return slug;
+  }
   return null;
 }
 
@@ -1381,8 +1430,11 @@ tg.command('llm', async (ctx) => {
 
 tg.command('llm_remove', async (ctx) => {
   if (ctx.chat.type !== 'private') return;
-  deleteUserLlmKey(ctx.from.id);
-  ctx.reply('🗑️ Your LLM key has been removed. The bot will use the host key going forward.');
+  const prov = ctx.message.text.replace('/llm_remove', '').trim().toLowerCase() || null;
+  deleteUserLlmKey(ctx.from.id, prov);
+  ctx.reply(prov
+    ? `🗑️ Your ${prov} key has been removed.`
+    : '🗑️ All your LLM keys have been removed. The bot will use host keys going forward.');
 });
 
 // ── Main message handler ──────────────────────────────────────────────────────
@@ -1435,13 +1487,14 @@ tg.on(messageFilter('text'), async (ctx) => {
 
   // BYOLLM enforcement — if host requires users to bring their own key (owner is always exempt)
   // Minds users bypass this — they authenticate via Minds credentials, not LLM keys
-  if (REQUIRE_USER_LLM && !isOwner && !isMindsContext && !getUserLlmKey(senderId)) {
+  if (REQUIRE_USER_LLM && !isOwner && !isMindsContext && !hasAnyUserLlmKey(senderId)) {
     await ctx.reply(
       'This bot requires you to connect your own AI API key.\n\n' +
       'DM me to set it up:\n' +
       '/llm anthropic <key> — from console.anthropic.com\n' +
       '/llm gemini <key> — from aistudio.google.com/apikey\n' +
-      '/llm openai <key> — from platform.openai.com\n\n' +
+      '/llm openai <key> — from platform.openai.com\n' +
+      '/llm openrouter <key> — from openrouter.ai (100+ models)\n\n' +
       'Or use Minds — connect your Minds AI agent:\n' +
       '/minds <alias> <builderApiKey>'
     ).catch(() => {});
@@ -1471,6 +1524,27 @@ tg.on(messageFilter('text'), async (ctx) => {
       await ctx.reply('⚠️ OPENAI_API_KEY is not set in .env.').catch(() => {});
       return;
     }
+
+    let orModel = null;
+    if (switchTarget === 'openrouter') {
+      const orKey = getUserLlmKeyFor(senderId, 'openrouter');
+      if (!orKey) {
+        await ctx.reply(
+          '⚠️ You need an OpenRouter key for that model.\n' +
+          'DM me /llm openrouter <key> to set up. Get one at openrouter.ai/keys'
+        ).catch(() => {});
+        return;
+      }
+      // If a specific model was named (e.g. "switch to kimi"), update the stored model
+      const namedModel = detectOpenRouterModel(cleanText);
+      if (namedModel) {
+        setUserLlmModel(senderId, 'openrouter', namedModel);
+        orModel = namedModel;
+      } else {
+        orModel = orKey.model || 'openai/gpt-4o';
+      }
+    }
+
     setChannelProvider(contextId, switchTarget);
     anthropicHistories.delete(contextId);
     geminiHistories.delete(contextId);
@@ -1478,6 +1552,7 @@ tg.on(messageFilter('text'), async (ctx) => {
     const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
       : switchTarget === 'openai' ? OPENAI_MODEL
       : switchTarget === 'minds' ? 'Minds'
+      : switchTarget === 'openrouter' ? orModel
       : CLAUDE_MODEL;
     await ctx.reply(`🔀 Switched to ${modelName}. Starting a fresh conversation.`).catch(() => {});
     return;
@@ -1496,7 +1571,6 @@ tg.on(messageFilter('text'), async (ctx) => {
 
   // Build context prefix
   const senderApiKey = getUserApiKey(senderId);
-  const userLlmKey = getUserLlmKey(senderId);
   const walletNote = senderApiKey
     ? '[User has a personal Quidli API key connected — drops will use their Smart Send wallet]'
     : isOwner
@@ -1520,20 +1594,28 @@ tg.on(messageFilter('text'), async (ctx) => {
   _pendingBasescanUrls.length = 0;
 
   try {
-    // Resolve which LLM key to use: user's own key takes priority over host key
-    const effectiveProvider = (provider !== 'minds' && userLlmKey) ? userLlmKey.provider : provider;
-    const effectiveLlmKey = userLlmKey?.apiKey ?? null;
-    const effectiveModel = userLlmKey?.model ?? null;
+    // The chat's switched provider decides what runs. Each user's messages use
+    // their own key for that provider if they have one, else the host key.
+    const effectiveProvider = provider;
+    const anthKey = getUserLlmKeyFor(senderId, 'anthropic');
+    const orKey = getUserLlmKeyFor(senderId, 'openrouter');
 
     if (effectiveProvider === 'gemini') {
-      accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
+      accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx, getUserLlmKeyFor(senderId, 'gemini')?.apiKey ?? null);
       modelLabel = GEMINI_MODEL;
     } else if (effectiveProvider === 'openai') {
-      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
+      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, getUserLlmKeyFor(senderId, 'openai')?.apiKey ?? null);
       modelLabel = OPENAI_MODEL;
     } else if (effectiveProvider === 'openrouter') {
-      const orModel = effectiveModel || 'openai/gpt-4o';
-      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey, {
+      if (!orKey) {
+        await editor.finalize(
+          '⚠️ This chat is in OpenRouter mode, but you don\'t have an OpenRouter key connected.\n' +
+          'DM me /llm openrouter <key> to set up (openrouter.ai/keys), or say "switch to claude" to change modes.'
+        );
+        return;
+      }
+      const orModel = orKey.model || 'openai/gpt-4o';
+      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, orKey.apiKey, {
         baseURL: 'https://openrouter.ai/api/v1',
         model: orModel,
       });
@@ -1564,14 +1646,14 @@ tg.on(messageFilter('text'), async (ctx) => {
           }
         } catch (err) {
           console.error('[minds-history] error:', err.message);
-          await bot.telegram.editMessageText(chatId, pendingMsg.message_id, undefined,
+          await tg.telegram.editMessageText(chatId, pendingMsg.message_id, undefined,
             '⚠️ Could not verify pending action — please try again.').catch(() => {});
           return;
         }
       }
 
       if (handoffText) {
-        accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, effectiveLlmKey);
+        accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, anthKey?.apiKey ?? null);
         modelLabel = `${CLAUDE_MODEL} (via Minds)`;
       } else {
         runMindsBackground(contextId, contextualText, chatId, pendingMsg.message_id, senderId, mindName)
@@ -1579,8 +1661,18 @@ tg.on(messageFilter('text'), async (ctx) => {
         return;
       }
     } else {
-      accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx, effectiveLlmKey);
-      modelLabel = CLAUDE_MODEL;
+      // anthropic (default). BYOLLM users without an Anthropic key but with an
+      // OpenRouter key get Claude routed through OpenRouter on their own credits.
+      if (REQUIRE_USER_LLM && !isOwner && !anthKey && orKey) {
+        accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, orKey.apiKey, {
+          baseURL: 'https://openrouter.ai/api/v1',
+          model: OPENROUTER_CLAUDE_SLUG,
+        });
+        modelLabel = `${OPENROUTER_CLAUDE_SLUG} (via OpenRouter)`;
+      } else {
+        accumulated = await runAnthropicLoop(contextId, contextualText, editor, toolCtx, anthKey?.apiKey ?? null);
+        modelLabel = CLAUDE_MODEL;
+      }
     }
 
     let finalText = accumulated || '(no response)';
