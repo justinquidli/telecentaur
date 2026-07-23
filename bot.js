@@ -74,11 +74,13 @@ You are TeleCentaur, a Telegram bot that sends crypto tokens to people using Qui
 ## Sending tokens (quidli_drop)
 - ALWAYS call quidli_lookup for every recipient FIRST, before calling quidli_drop.
 - Email, phone, Twitter/X, and Farcaster recipients: quidli_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call quidli_lookup again with the same payload (wait ~2s between tries, up to ~10 tries) until it returns "completed". This is expected and means a wallet is being created; do not give up early.
-- Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix. If you have the person's numeric Telegram ID (e.g. from message context in this chat, or via quidli_exposed), use that instead of their username — it resolves reliably.
+- Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix.
+- For Telegram usernames specifically: ALWAYS call resolve_telegram_username FIRST before quidli_lookup/quidli_drop. It checks every chat this bot has seen them post in and returns their numeric ID if found — use that ID (not the username) for quidli_lookup and quidli_drop.
+- If resolve_telegram_username finds nothing AND quidli_lookup/quidli_drop confirms the username can't be resolved: do NOT just tell the user to wait around. Call create_pending_claim with the recipient's username and the drop details instead. This returns a one-tap claim link. If you're in a group chat, the tool automatically posts the link directly, tagging the recipient — just tell the requester it's done, no need to forward anything. If you're in a DM, the bot has no way to reach the recipient directly, so tell the requester to forward the link themselves. Either way, once the recipient taps it, their wallet resolves and the drop executes automatically — no further action needed from anyone after that tap. Always prefer offering this claim link over saying "ask them to connect" or "ask them to message me" — it's faster and requires only one tap from the recipient.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
 - Always generate a fresh UUID for idempotencyKey.
 - After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
-- If a Telegram username genuinely can't be resolved (no numeric ID available), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
+- If create_pending_claim also fails (no Quidli key connected), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
 
 ## Looking up wallets (quidli_lookup)
@@ -221,6 +223,21 @@ db.exec(`CREATE TABLE IF NOT EXISTS scheduled_drops (
   executed   INTEGER DEFAULT 0
 )`);
 try { db.exec(`ALTER TABLE scheduled_drops ADD COLUMN chat_id TEXT`); } catch { }
+// Pending claims — for Telegram recipients that can't be resolved by username.
+// The sender gets a shareable t.me deep link; when the recipient clicks it and
+// starts the bot, we get their numeric ID and execute the drop immediately.
+// Nothing is moved on-chain until claimed, so an expired claim needs no refund.
+db.exec(`CREATE TABLE IF NOT EXISTS pending_claims (
+  id           TEXT PRIMARY KEY,
+  sender_id    TEXT NOT NULL,
+  chat_id      TEXT,
+  recipient_username TEXT NOT NULL,
+  drop_input   TEXT NOT NULL,
+  created_at   INTEGER DEFAULT (unixepoch()),
+  expires_at   INTEGER NOT NULL,
+  claimed      INTEGER DEFAULT 0,
+  expired      INTEGER DEFAULT 0
+)`);
 db.exec(`CREATE TABLE IF NOT EXISTS watchers (
   id             TEXT PRIMARY KEY,
   sender_id      TEXT NOT NULL,
@@ -334,6 +351,17 @@ function recordChatMember(chatId, userId, username) {
 
 function getChatMembers(chatId) {
   return db.prepare('SELECT user_id, username FROM chat_members WHERE chat_id = ?').all(String(chatId));
+}
+
+// Search every chat the bot has ever seen (not just the current one) for a username
+// this lets us resolve a Telegram @handle to a numeric ID even if they've never
+// DMed the bot directly, as long as they've posted in any shared group.
+function findUserIdByUsername(username) {
+  const clean = username.replace(/^@/, '').toLowerCase();
+  const row = db.prepare(
+    'SELECT user_id, username FROM chat_members WHERE LOWER(username) = ? ORDER BY last_seen DESC LIMIT 1'
+  ).get(clean);
+  return row ? row.user_id : null;
 }
 
 // ─── Provider switching ───────────────────────────────────────────────────────
@@ -764,6 +792,31 @@ const tools = [
     description: 'Get all known members of the current Telegram group chat. Use this when someone asks to send tokens to "everyone", "all members", "the whole group", or similar. Returns a list of Telegram user IDs and usernames of people who have sent messages in this chat.',
     input_schema: { type: 'object', properties: {} },
   },
+  {
+    name: 'resolve_telegram_username',
+    description: 'Resolve a Telegram @username to its numeric Telegram ID by checking every group chat this bot has ever seen them post in. ALWAYS try this BEFORE calling quidli_lookup/quidli_drop with a raw Telegram username, since Telegram itself does not let Quidli resolve arbitrary usernames — only numeric IDs work reliably. If this returns a numeric ID, use { type: "telegram", id: "<id>" } for quidli_lookup and quidli_drop instead of username. If it returns nothing, the bot has never seen that user active anywhere, and you should tell the requester to ask them to DM this bot directly (any message, even just "hi") — after they do, this will resolve them.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        username: { type: 'string', description: 'The Telegram @username to resolve, without or with the @ sign.' },
+      },
+      required: ['username'],
+    },
+  },
+  {
+    name: 'create_pending_claim',
+    description: 'When a Telegram username cannot be resolved (resolve_telegram_username found nothing, and Quidli lookup fails), use this INSTEAD of giving up. It creates a one-time shareable link — send it to the requester and tell them to forward it to the recipient. As soon as the recipient clicks it and starts this bot (a single tap, no typing needed), their wallet resolves automatically and the drop executes immediately. The claim holds for 3 days; if unclaimed by then, it silently expires and no funds are ever moved (nothing to refund since nothing was sent).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        recipientUsername: { type: 'string', description: 'The Telegram @username (without @) this claim is for — just for display in messages.' },
+        amountInWeiPerRecipient: { type: 'string', description: 'Amount in wei, e.g. 1000000 for 1 USDC (6 decimals).' },
+        tokenContract: { type: 'string', description: 'ERC-20 token contract address.' },
+        chainId: { type: 'number', description: 'Chain ID, e.g. 8453 for Base.' },
+      },
+      required: ['recipientUsername', 'amountInWeiPerRecipient', 'tokenContract', 'chainId'],
+    },
+  },
 ];
 
 // Tracks basescan URLs produced during a turn so they're always shown
@@ -771,7 +824,7 @@ const _pendingBasescanUrls = [];
 
 // ─── Tool runner ──────────────────────────────────────────────────────────────
 
-async function runTool(name, input, { senderId, senderApiKey, currentChatId } = {}) {
+async function runTool(name, input, { senderId, senderApiKey, currentChatId, isPrivateChat } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
 
   if (name === 'web_search') {
@@ -899,6 +952,55 @@ async function runTool(name, input, { senderId, senderApiKey, currentChatId } = 
     }, null, 2);
   }
 
+  if (name === 'resolve_telegram_username') {
+    const telegramId = findUserIdByUsername(input.username);
+    if (telegramId) {
+      return JSON.stringify({ found: true, telegramId, note: `Use { type: "telegram", id: "${telegramId}" } for quidli_lookup/quidli_drop.` });
+    }
+    return JSON.stringify({
+      found: false,
+      note: 'This bot has never seen that username active in any chat it\'s in. Ask the requester to have that person DM this bot directly (any message) — after that, resolve_telegram_username will find them.',
+    });
+  }
+
+  if (name === 'create_pending_claim') {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) {
+      return JSON.stringify({ error: 'No Quidli API key connected. DM me /connect <your-api-key> to link your account.' });
+    }
+    const dropInput = {
+      amountInWeiPerRecipient: input.amountInWeiPerRecipient,
+      tokenContract: input.tokenContract,
+      chainId: input.chainId,
+    };
+    const cleanUsername = input.recipientUsername.replace(/^@/, '');
+    const claim = createPendingClaim(senderId, currentChatId, cleanUsername, dropInput);
+
+    // In a group chat, post the link directly so the recipient sees it without
+    // the sender needing to forward anything — the bot can't DM them directly
+    // (no numeric ID yet), but it can post in a chat it's already in.
+    let postedDirectly = false;
+    if (!isPrivateChat) {
+      try {
+        await tg.telegram.sendMessage(currentChatId, `@${cleanUsername} — tap here to claim your tokens: ${claim.link}`);
+        postedDirectly = true;
+      } catch (err) {
+        console.error('[claim] failed to post link in chat:', err.message);
+      }
+    }
+
+    return JSON.stringify({
+      success: true,
+      claimLink: claim.link,
+      expiresAt: new Date(claim.expiresAt * 1000).toISOString(),
+      postedDirectlyInChat: postedDirectly,
+      note: postedDirectly
+        ? 'The claim link was already posted directly in this chat, tagging the recipient — no need to forward it yourself.'
+        : 'This is a DM, so I can\'t reach the recipient directly. Share this link with them yourself — one tap and the drop executes automatically. Expires in 3 days unclaimed.',
+    });
+  }
+
   throw new Error(`Unknown tool: ${name}`);
 }
 
@@ -988,6 +1090,92 @@ async function executeConditionalDrop(jobId) {
     const notifyChat = job.chat_id ?? job.sender_id;
     await tg.telegram.sendMessage(notifyChat, `⚠️ Conditional drop failed: ${err.message}`).catch(() => {});
   }
+}
+
+const CLAIM_HOLD_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+
+function createPendingClaim(senderId, chatId, recipientUsername, dropInput) {
+  const id = crypto.randomUUID();
+  const expiresAt = Math.floor((Date.now() + CLAIM_HOLD_MS) / 1000);
+  db.prepare(`INSERT INTO pending_claims (id, sender_id, chat_id, recipient_username, drop_input, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(id, String(senderId), String(chatId), recipientUsername, JSON.stringify(dropInput), expiresAt);
+  scheduleClaimExpiry(id, expiresAt * 1000);
+  return { id, expiresAt, link: `https://t.me/${tg.botInfo?.username}?start=claim_${id}` };
+}
+
+function scheduleClaimExpiry(claimId, expiresAtMs) {
+  const delay = Math.max(0, expiresAtMs - Date.now());
+  setTimeout(() => expireClaimIfUnclaimed(claimId), delay);
+}
+
+function expireClaimIfUnclaimed(claimId) {
+  const claim = db.prepare('SELECT * FROM pending_claims WHERE id = ? AND claimed = 0 AND expired = 0').get(claimId);
+  if (!claim) return; // already claimed, or already expired
+  db.prepare('UPDATE pending_claims SET expired = 1 WHERE id = ?').run(claimId);
+  const notifyChat = claim.chat_id ?? claim.sender_id;
+  tg.telegram.sendMessage(notifyChat,
+    `⌛ The claim link for @${claim.recipient_username} expired unclaimed after 3 days. No funds were sent — nothing to refund.`
+  ).catch(() => {});
+  console.log(`[claim] ${claimId} expired unclaimed (@${claim.recipient_username})`);
+}
+
+async function executeClaimedDrop(claimId, claimerTelegramId, claimerUsername) {
+  const claim = db.prepare('SELECT * FROM pending_claims WHERE id = ? AND claimed = 0 AND expired = 0').get(claimId);
+  if (!claim) return { ok: false, reason: 'This claim link is invalid, already used, or has expired.' };
+
+  // Verify the person clicking is actually the intended recipient, not whoever got the link first
+  const claimerHandle = (claimerUsername ?? '').replace(/^@/, '').toLowerCase();
+  if (claimerHandle !== claim.recipient_username.toLowerCase()) {
+    console.warn(`[claim] ${claimId} rejected — meant for @${claim.recipient_username}, clicked by @${claimerUsername ?? '(no username)'}`);
+    return {
+      ok: false,
+      reason: `This claim is for @${claim.recipient_username}, not you. If that's your username and you're seeing this by mistake, make sure your Telegram username in Settings is set to exactly @${claim.recipient_username} (case doesn't matter) and try the link again.`,
+    };
+  }
+
+  const isOwner = BOT_OWNER_ID && claim.sender_id === String(BOT_OWNER_ID);
+  const senderApiKey = getUserApiKey(claim.sender_id);
+  const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+  if (!keyToUse) {
+    // Don't mark as claimed — nothing was attempted, so the real recipient
+    // must be able to retry once the sender reconnects a key.
+    return { ok: false, reason: 'The sender no longer has a connected Quidli API key — ask them to reconnect and resend.' };
+  }
+
+  // Atomic claim-and-lock: only flips if still unclaimed/unexpired at this instant,
+  // so two near-simultaneous clicks (e.g. Telegram retrying the update) can't both
+  // pass through and trigger two transfers.
+  const lock = db.prepare('UPDATE pending_claims SET claimed = 1 WHERE id = ? AND claimed = 0 AND expired = 0').run(claimId);
+  if (lock.changes === 0) {
+    return { ok: false, reason: 'This claim link is invalid, already used, or has expired.' };
+  }
+
+  const dropParams = JSON.parse(claim.drop_input);
+  dropParams.recipients = [{ type: 'telegram', id: String(claimerTelegramId) }];
+
+  try {
+    const result = await quidliDrop(dropParams, keyToUse);
+    const notifyChat = claim.chat_id ?? claim.sender_id;
+    if (result.transferHash) {
+      await tg.telegram.sendMessage(notifyChat,
+        `✅ @${claim.recipient_username} claimed their tokens!\nhttps://basescan.org/tx/${result.transferHash}`
+      ).catch(() => {});
+    }
+    return { ok: true, result };
+  } catch (err) {
+    console.error(`[claim] ${claimId} drop failed:`, err.message);
+    db.prepare('UPDATE pending_claims SET claimed = 0 WHERE id = ?').run(claimId); // allow retry
+    return { ok: false, reason: `Drop failed: ${err.message}` };
+  }
+}
+
+function loadPendingClaims() {
+  const pending = db.prepare('SELECT id, expires_at FROM pending_claims WHERE claimed = 0 AND expired = 0').all();
+  for (const claim of pending) {
+    scheduleClaimExpiry(claim.id, claim.expires_at * 1000);
+  }
+  if (pending.length) console.log(`[claim] re-queued ${pending.length} pending claim(s)`);
 }
 
 function loadPendingDrops() {
@@ -1477,6 +1665,30 @@ tg.command('llm_remove', async (ctx) => {
     : '🗑️ All your LLM keys have been removed. The bot will use host keys going forward.');
 });
 
+// ── /start — handles both plain start and claim deep links (?start=claim_<id>) ─
+tg.start(async (ctx) => {
+  const payload = ctx.startPayload ?? '';
+  recordChatMember(ctx.chat.id, ctx.from.id, ctx.from.username ?? ctx.from.first_name ?? String(ctx.from.id));
+
+  if (!payload.startsWith('claim_')) {
+    return ctx.reply(
+      "I'm TeleCentaur, your crypto-sending assistant. Mention me in a group or DM me to send USDC, check wallets, and more.\n\n" +
+      'DM /connect <your-api-key> to link your own Quidli wallet — get a key at connect.quid.li'
+    );
+  }
+
+  const claimId = payload.slice('claim_'.length);
+  const outcome = await executeClaimedDrop(claimId, ctx.from.id, ctx.from.username);
+  if (outcome.ok) {
+    const finalText = outcome.result.transferHash
+      ? `🎉 You've claimed your tokens!\nhttps://basescan.org/tx/${outcome.result.transferHash}`
+      : "🎉 You've claimed your tokens!";
+    await ctx.reply(finalText);
+  } else {
+    await ctx.reply(`⚠️ ${outcome.reason}`);
+  }
+});
+
 // ── Main message handler ──────────────────────────────────────────────────────
 
 tg.on(messageFilter('text'), async (ctx) => {
@@ -1493,10 +1705,9 @@ tg.on(messageFilter('text'), async (ctx) => {
   const isMentioned = botUsername && text.includes(`@${botUsername}`);
   const isReplyToBot = msg.reply_to_message?.from?.id === tg.botInfo?.id;
 
-  // Track all group members passively (so "everyone" drops work)
-  if (!isPrivate) {
-    recordChatMember(chatId, senderId, username);
-  }
+  // Track everyone who messages the bot — in groups (so "everyone" drops work)
+  // and in DMs (so resolve_telegram_username can find anyone who's ever messaged the bot directly)
+  recordChatMember(chatId, senderId, username);
 
   if (!isPrivate && !isMentioned && !isReplyToBot) {
     // Still check watchers even if not mentioned
@@ -1622,6 +1833,7 @@ tg.on(messageFilter('text'), async (ctx) => {
     senderId,
     senderApiKey,
     currentChatId: chatId,
+    isPrivateChat: isPrivate,
   };
 
   let accumulated = '';
@@ -1746,6 +1958,7 @@ tg.launch({
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
   loadPendingDrops();
+  loadPendingClaims();
 });
 
 process.once('SIGINT', () => tg.stop('SIGINT'));
