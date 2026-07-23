@@ -72,15 +72,15 @@ You are TeleCentaur, a Telegram bot that sends crypto tokens to people using Qui
 - Be concise. One sentence for success, one sentence for failure.
 
 ## Sending tokens (quidli_drop)
-- Call quidli_drop DIRECTLY with social identities — you do NOT need to call quidli_lookup first. Quidli resolves identities internally.
+- ALWAYS call quidli_lookup for every recipient FIRST, before calling quidli_drop. quidli_lookup auto-generates a wallet for recipients who aren't in the Quidli registry yet — it may take a few seconds while it processes, but it will resolve them. Only after quidli_lookup succeeds for a recipient should you call quidli_drop for them.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
 - Always generate a fresh UUID for idempotencyKey.
 - After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
-- If a recipient isn't in the registry, still attempt the drop — Quidli will hold it as a pending claim.
+- If quidli_drop still returns an error like "Some recipients could not be resolved" even after a successful quidli_lookup, tell the user exactly that and point them to https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
 
 ## Looking up wallets (quidli_lookup)
-Only call quidli_lookup when the user specifically asks for a wallet address. Do NOT call it before drops.
+Call quidli_lookup whenever the user asks for a wallet address, AND always before every quidli_drop (see above) — it resolves identities and auto-generates wallets for people not yet in the registry.
 
 Supported identity types: discord, farcaster, twitter, telegram, email, github, linkedin, phone.
 
@@ -1098,10 +1098,12 @@ async function runAnthropicLoop(contextId, contextualText, editor, toolCtx, user
   let messages = [...history];
   let accumulated = '';
   const client = getAnthropicClient(userLlmKey);
+  const modelUsed = modelOverride || CLAUDE_MODEL;
+  console.log(`[api-call] anthropic model="${modelUsed}" baseURL="api.anthropic.com" usingUserKey=${!!userLlmKey}`);
 
   while (true) {
     const response = await client.messages.create({
-      model: modelOverride || CLAUDE_MODEL,
+      model: modelUsed,
       max_tokens: 4096,
       system: SYSTEM_PROMPT,
       tools,
@@ -1187,6 +1189,7 @@ async function runGeminiLoop(contextId, contextualText, editor, toolCtx, userLlm
 async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlmKey, { baseURL, model } = {}) {
   const openai = await getOpenAIClient(userLlmKey, baseURL);
   const modelToUse = model || OPENAI_MODEL;
+  console.log(`[api-call] openai-compatible model="${modelToUse}" baseURL="${baseURL || 'api.openai.com (default)'}" usingUserKey=${!!userLlmKey}`);
   const history = getOpenAIHistory(contextId);
   history.push({ role: 'user', content: contextualText });
   let messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history];
