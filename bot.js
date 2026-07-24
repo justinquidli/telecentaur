@@ -822,6 +822,23 @@ const tools = [
 // Tracks basescan URLs produced during a turn so they're always shown
 const _pendingBasescanUrls = [];
 
+// Some models (observed: Kimi K2.6 via OpenRouter) will occasionally narrate a
+// fake "transaction sent" message with an invented tx hash instead of actually
+// calling quidli_drop. Since this bot moves real money, never trust a model's
+// own claim of a basescan link — only ever show one that came from a real
+// quidliDrop() result this turn. Anything else gets stripped and flagged.
+const BASESCAN_TX_RE = /https?:\/\/basescan\.org\/tx\/(0x[a-fA-F0-9]{64})/g;
+function sanitizeUnverifiedTxClaims(text, realUrls) {
+  const realHashes = new Set(
+    realUrls.map((u) => u.match(/0x[a-fA-F0-9]{64}/)?.[0]?.toLowerCase()).filter(Boolean)
+  );
+  return text.replace(BASESCAN_TX_RE, (fullMatch, hash) => {
+    if (realHashes.has(hash.toLowerCase())) return fullMatch;
+    console.warn(`[safety] stripped unverified/fabricated tx link from model output: ${fullMatch}`);
+    return '⚠️ [unverified transaction link removed — no matching transfer was actually recorded, this may not have really happened]';
+  });
+}
+
 // ─── Tool runner ──────────────────────────────────────────────────────────────
 
 async function runTool(name, input, { senderId, senderApiKey, currentChatId, isPrivateChat } = {}) {
@@ -1925,6 +1942,7 @@ tg.on(messageFilter('text'), async (ctx) => {
     }
 
     let finalText = accumulated || '(no response)';
+    finalText = sanitizeUnverifiedTxClaims(finalText, _pendingBasescanUrls);
     for (const url of _pendingBasescanUrls) {
       if (!finalText.includes(url)) finalText += `\n🔗 ${url}`;
     }
