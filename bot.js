@@ -41,8 +41,16 @@ const {
   GEMINI_MODEL = 'gemini-2.0-flash',
   OPENAI_API_KEY,
   OPENAI_MODEL = 'gpt-4o',
+  NOUS_API_KEY,                  // Nous Portal API key — from portal.nousresearch.com (API keys)
+  NOUS_MODEL = 'Hermes-4-405B',  // or Hermes-4-70B — see portal.nousresearch.com/info for the full catalog
   REQUIRE_USER_LLM_KEY = 'false', // Set to 'true' to require users to bring their own LLM key
 } = process.env;
+
+// Nous Portal is OpenAI-compatible — reuses runOpenAILoop with a custom baseURL,
+// same pattern as OpenRouter. Note: Nous's own docs say Hermes 4 isn't tuned for
+// rapid-fire tool-calling loops (it's a chat/reasoning model) — wired in anyway
+// per explicit request, so tool-call behavior may be less reliable than Claude/GPT/Gemini.
+const NOUS_API_BASE_URL = 'https://inference-api.nousresearch.com/v1';
 
 const REQUIRE_USER_LLM = REQUIRE_USER_LLM_KEY === 'true';
 
@@ -390,10 +398,12 @@ function detectProviderSwitch(text) {
   if (/(switch|change|use|swap)\s+(to\s+)?(openai|gpt|chatgpt|open\s*ai)/.test(lower)) return 'openai';
   if (/(switch|change|use|swap)\s+(to\s+)?(claude|anthropic|fable|opus|haiku|sonnet)/.test(lower)) return 'anthropic';
   if (/(switch|change|use|swap)\s+(to\s+)?(openrouter|open\s*router|kimi|llama|mistral|deepseek)/.test(lower)) return 'openrouter';
+  if (/(switch|change|use|swap)\s+(to\s+)?(hermes|nous)/.test(lower)) return 'hermes';
   if (/\bgemini\s+mode\b/.test(lower)) return 'gemini';
   if (/\bopenai\s+mode\b/.test(lower)) return 'openai';
   if (/\b(claude|fable|opus|haiku|sonnet)\s+mode\b/.test(lower)) return 'anthropic';
   if (/\b(openrouter|kimi|llama|mistral|deepseek)\s+mode\b/.test(lower)) return 'openrouter';
+  if (/\b(hermes|nous)\s+mode\b/.test(lower)) return 'hermes';
   if (/(switch|change|use|swap)\s+(to\s+)?minds/.test(lower)) return 'minds';
   if (/\bminds\s+mode\b/.test(lower)) return 'minds';
   return null;
@@ -1652,7 +1662,8 @@ tg.command('llm', async (ctx) => {
       '  anthropic  — from console.anthropic.com\n' +
       '  gemini     — from aistudio.google.com/apikey\n' +
       '  openai     — from platform.openai.com\n' +
-      '  openrouter — from openrouter.ai (access 100+ models)\n\n' +
+      '  openrouter — from openrouter.ai (access 100+ models)\n' +
+      '  hermes     — from portal.nousresearch.com (API keys)\n\n' +
       'For OpenRouter, you can optionally specify a model:\n' +
       '  /llm openrouter <key> [model]\n' +
       '  Example: /llm openrouter sk-or-... meta-llama/llama-3-70b-instruct\n' +
@@ -1661,8 +1672,8 @@ tg.command('llm', async (ctx) => {
     );
   }
 
-  if (!['anthropic', 'gemini', 'openai', 'openrouter'].includes(provider)) {
-    return ctx.reply('Unknown provider. Use: anthropic, gemini, openai, or openrouter');
+  if (!['anthropic', 'gemini', 'openai', 'openrouter', 'hermes'].includes(provider)) {
+    return ctx.reply('Unknown provider. Use: anthropic, gemini, openai, openrouter, or hermes');
   }
 
   setUserLlmKey(ctx.from.id, provider, apiKey, model);
@@ -1762,7 +1773,8 @@ tg.on(messageFilter('text'), async (ctx) => {
       '/llm anthropic <key> — from console.anthropic.com\n' +
       '/llm gemini <key> — from aistudio.google.com/apikey\n' +
       '/llm openai <key> — from platform.openai.com\n' +
-      '/llm openrouter <key> — from openrouter.ai (100+ models)\n\n' +
+      '/llm openrouter <key> — from openrouter.ai (100+ models)\n' +
+      '/llm hermes <key> — from portal.nousresearch.com\n\n' +
       'Or use Minds — connect your Minds AI agent:\n' +
       '/minds <alias> <builderApiKey>'
     ).catch(() => {});
@@ -1792,6 +1804,10 @@ tg.on(messageFilter('text'), async (ctx) => {
       await ctx.reply('⚠️ OPENAI_API_KEY is not set in .env.').catch(() => {});
       return;
     }
+    if (switchTarget === 'hermes' && !NOUS_API_KEY && !getUserLlmKeyFor(senderId, 'hermes')) {
+      await ctx.reply('⚠️ NOUS_API_KEY is not set in .env, and you don\'t have a personal Hermes key connected. DM me /llm hermes <key> (get one at portal.nousresearch.com).').catch(() => {});
+      return;
+    }
 
     let namedModel = null;
     if (switchTarget === 'openrouter') {
@@ -1816,6 +1832,7 @@ tg.on(messageFilter('text'), async (ctx) => {
     openaiHistories.delete(contextId);
     const modelName = switchTarget === 'gemini' ? GEMINI_MODEL
       : switchTarget === 'openai' ? OPENAI_MODEL
+      : switchTarget === 'hermes' ? NOUS_MODEL
       : switchTarget === 'minds' ? 'Minds'
       : (namedModel || CLAUDE_MODEL);
     await ctx.reply(`🔀 Switched to ${modelName}. Starting a fresh conversation.`).catch(() => {});
@@ -1886,6 +1903,22 @@ tg.on(messageFilter('text'), async (ctx) => {
         model: orModel,
       });
       modelLabel = orModel;
+    } else if (effectiveProvider === 'hermes') {
+      const hermesUserKey = getUserLlmKeyFor(senderId, 'hermes')?.apiKey ?? null;
+      const hermesKey = hermesUserKey || NOUS_API_KEY;
+      if (!hermesKey) {
+        await editor.finalize(
+          '⚠️ This chat is in Hermes mode, but no NOUS_API_KEY is set in .env and you don\'t have a personal Hermes key connected.\n' +
+          'DM me /llm hermes <key> to set up (portal.nousresearch.com), or say "switch to claude" to change modes.'
+        );
+        return;
+      }
+      const hermesModel = chModel || NOUS_MODEL;
+      accumulated = await runOpenAILoop(contextId, contextualText, editor, toolCtx, hermesKey, {
+        baseURL: NOUS_API_BASE_URL,
+        model: hermesModel,
+      });
+      modelLabel = hermesModel;
     } else if (effectiveProvider === 'minds') {
       const creds = getUserMindsCredentials(senderId);
       const mindName = creds?.name ?? 'unknown';
@@ -1954,7 +1987,7 @@ tg.on(messageFilter('text'), async (ctx) => {
   } catch (err) {
     console.error(`[${provider}] error:`, err);
     if (provider === 'gemini') { const h = getGeminiHistory(contextId); if (h.at(-1)?.role === 'user') h.pop(); }
-    else if (provider === 'openai') { const h = getOpenAIHistory(contextId); if (h.at(-1)?.role === 'user') h.pop(); }
+    else if (provider === 'openai' || provider === 'hermes') { const h = getOpenAIHistory(contextId); if (h.at(-1)?.role === 'user') h.pop(); }
     else { const h = getAnthropicHistory(contextId); if (h.at(-1)?.role === 'user') h.pop(); }
     await editor.finalize(`⚠️ Error: ${err.message?.slice(0, 200) ?? 'Unknown error'}`);
   }
@@ -1972,6 +2005,7 @@ tg.launch({
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER}`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
+  if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — not tuned for tool-calling, per Nous's own guidance)`);
   console.log(`   Minds: per-user keys (DM /minds <key> to register)`);
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
