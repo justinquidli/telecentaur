@@ -12,7 +12,8 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 - **Channel watchers** — send tokens to the first person who types a trigger phrase in a group
 - **Cancel / reschedule** — manage pending scheduled drops and watchers
 - **Per-user API keys** — users can DM `/connect <key>` to link their own Quidli account
-- **Multi-LLM support** — switch between Claude, Gemini, OpenAI, and Minds AI per chat
+- **Multi-LLM support** — switch between Claude, Gemini, OpenAI, OpenRouter, Hermes (Nous Portal, 200+ models), and Minds AI per chat
+- **Bring your own key** — users DM `/llm <provider> <key>` to run on their own credits
 - **Minds AI handoff** — your personal Mind researches and plans; Claude executes on confirmation
 
 ## How it works
@@ -71,11 +72,13 @@ cp .env.example .env
 | `BOT_OWNER_ID` | — | Your Telegram user ID — you can trigger drops using the host Quidli wallet without `/connect`. Find it by messaging [@userinfobot](https://t.me/userinfobot). |
 | `BRAVE_SEARCH_API_KEY` | — | From [brave.com/search/api](https://brave.com/search/api) — required for web search and conditional drops |
 | `CLAUDE_MODEL` | — | Defaults to `claude-sonnet-4-6` |
-| `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, or `openai` |
+| `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, `openai`, or `hermes` |
 | `GEMINI_API_KEY` | — | From [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `GEMINI_MODEL` | — | Defaults to `gemini-2.5-flash` |
 | `OPENAI_API_KEY` | — | From [platform.openai.com](https://platform.openai.com) |
 | `OPENAI_MODEL` | — | Defaults to `gpt-4o` |
+| `NOUS_API_KEY` | — | From [portal.nousresearch.com](https://portal.nousresearch.com) — one key, 200+ models |
+| `NOUS_MODEL` | — | Defaults to `tencent/hy3:free` (free tier, supports tool calling) |
 | `TELEGRAM_ALLOWED_USERS` | — | Comma-separated Telegram user IDs allowed to use the bot. Empty = everyone |
 | `BOT_WALLET_PRIVATE_KEY` | — | Private key of a funded wallet for x402 pay-per-request on `/lookup` |
 | `SYSTEM_PROMPT` | — | Override the default system prompt |
@@ -118,9 +121,51 @@ Switch the active LLM per chat at any time:
 switch to gemini
 switch to claude
 switch to openai
+switch to hermes
+switch to openrouter
 ```
 
+Naming a model in the phrase selects it too — `switch to fable`, `switch to opus`,
+`switch to kimi`, `switch to llama`, `switch to deepseek`, `switch to mistral`.
+
 The choice persists across bot restarts (stored in SQLite).
+
+### Bring your own key
+
+Any user can run on their own credits by DMing the bot. Keys are stored AES-256-GCM
+encrypted (set `MASTER_ENCRYPTION_KEY`) and used instead of the host's:
+
+```
+/llm anthropic <key>
+/llm gemini <key>
+/llm openai <key>
+/llm openrouter <key> [model]
+/llm hermes <key> [model]
+/llm_remove
+```
+
+### OpenRouter
+
+`switch to openrouter` routes through [openrouter.ai](https://openrouter.ai) — 100+ models on one
+key. There's no host-level OpenRouter key: it's per-user only, so each person DMs `/llm openrouter
+<key>` first. Default model is `openai/gpt-4o`.
+
+### Hermes / Nous Portal
+
+`switch to hermes` routes the chat through [Nous Portal](https://portal.nousresearch.com), an
+OpenAI-compatible gateway to 200+ models under one key. Set `NOUS_API_KEY` to give everyone the
+host default (`NOUS_MODEL`, defaults to `tencent/hy3:free` — free tier and supports tool calling).
+
+Users can bring their own key and choose any model by DMing the bot:
+
+```
+/llm hermes <your-nous-key> anthropic/claude-sonnet-4.6
+/llm hermes <your-nous-key> tencent/hy3:free
+```
+
+Model slugs are vendor-prefixed; free variants end in `:free`. Note that Nous's own docs advise
+against the `Hermes-4-*` models for rapid tool-calling loops — prefer an agentic model for drops
+and lookups.
 
 ### Minds AI (experimental)
 
