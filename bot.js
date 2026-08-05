@@ -50,7 +50,11 @@ const {
   // Paid tiers can use any of the 200+ slugs (anthropic/claude-sonnet-4.6, etc).
   // Users can override per-chat with: /llm hermes <key> <model>
   NOUS_MODEL = 'tencent/hy3:free',
-  REQUIRE_USER_LLM_KEY = 'false', // Set to 'true' to require users to bring their own LLM key
+  REQUIRE_USER_LLM_KEY = 'false', // Legacy — host keys are now owner/allowlist-only regardless
+  // Who may spend the HOST's LLM keys. The owner always can. Everyone else must
+  // either be listed here or connect their own key for the provider in use.
+  // Comma-separated Telegram @handles and/or numeric IDs, e.g. "alice,482970829"
+  HOST_KEY_ALLOWED_USERS = '',
 } = process.env;
 
 // Nous Portal is OpenAI-compatible — reuses runOpenAILoop with a custom baseURL,
@@ -70,6 +74,22 @@ if (!BOT_WALLET_PRIVATE_KEY && !QUIDLI_API_KEY) {
 const ALLOWED_USERS = new Set(
   TELEGRAM_ALLOWED_USERS.split(',').map((s) => s.trim()).filter(Boolean)
 );
+
+// Handles/IDs permitted to spend the host's LLM keys (owner is always permitted).
+const HOST_KEY_USERS = new Set(
+  HOST_KEY_ALLOWED_USERS.split(',').map((s) => s.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)
+);
+
+// Providers that would otherwise silently fall back to a host key.
+// 'openrouter' and 'minds' are per-user by design and never touch host credentials.
+const HOST_KEY_PROVIDERS = new Set(['anthropic', 'gemini', 'openai', 'hermes']);
+
+function mayUseHostKey(senderId, username) {
+  if (BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID)) return true;
+  if (HOST_KEY_USERS.has(String(senderId).toLowerCase())) return true;
+  if (username && HOST_KEY_USERS.has(String(username).replace(/^@/, '').toLowerCase())) return true;
+  return false;
+}
 
 const TG_MSG_LIMIT = 4000;
 const EDIT_THROTTLE_MS = 1000; // Telegram rate limits are stricter than Discord
@@ -1736,7 +1756,9 @@ tg.command('llm', async (ctx) => {
     : provider === 'hermes' ? ` (model: ${model || NOUS_MODEL})`
     : '';
   ctx.reply(
-    `✅ Connected your ${provider} key${modelNote}. Your messages will now use your own ${provider} credits.\n\n` +
+    `✅ Connected your ${provider} key${modelNote}.\n\n` +
+    `This applies wherever a chat is running on ${provider}. If a chat is on a different ` +
+    `provider, say "switch to ${provider}" there first — then it'll run on your own credits.\n\n` +
     '⚠️ Your key is stored encrypted. DM /llm_remove anytime to disconnect.'
   );
 });
@@ -1814,30 +1836,6 @@ tg.on(messageFilter('text'), async (ctx) => {
   // Owner check — used for BYOLLM exemption and wallet note below
   const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
 
-  // Peek at provider intent before BYOLLM check — Minds doesn't need an LLM key
-  const cleanTextPeek = botUsername
-    ? text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim()
-    : text.trim();
-  const switchPeek = detectProviderSwitch(cleanTextPeek);
-  const isMindsContext = switchPeek === 'minds' || getChannelProvider(String(chatId)) === 'minds';
-
-  // BYOLLM enforcement — if host requires users to bring their own key (owner is always exempt)
-  // Minds users bypass this — they authenticate via Minds credentials, not LLM keys
-  if (REQUIRE_USER_LLM && !isOwner && !isMindsContext && !hasAnyUserLlmKey(senderId)) {
-    await ctx.reply(
-      'This bot requires you to connect your own AI API key.\n\n' +
-      'DM me to set it up:\n' +
-      '/llm anthropic <key> — from console.anthropic.com\n' +
-      '/llm gemini <key> — from aistudio.google.com/apikey\n' +
-      '/llm openai <key> — from platform.openai.com\n' +
-      '/llm openrouter <key> — from openrouter.ai (100+ models)\n' +
-      '/llm hermes <key> — from portal.nousresearch.com\n\n' +
-      'Or use Minds — connect your Minds AI agent:\n' +
-      '/minds <alias> <builderApiKey>'
-    ).catch(() => {});
-    return;
-  }
-
   // Strip bot mention from text
   const cleanText = botUsername
     ? text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim()
@@ -1849,6 +1847,44 @@ tg.on(messageFilter('text'), async (ctx) => {
   }
 
   const contextId = String(chatId);
+
+  // ── Host-key protection ──────────────────────────────────────────────────────
+  // The host's LLM keys are spendable only by the owner or explicitly authorized
+  // handles. Everyone else must have their own key FOR THE PROVIDER IN USE — a
+  // Gemini key must not unlock the host's Nous key. Checked before the switch is
+  // applied, since switching changes the provider for everyone in the chat.
+  // Providers outside HOST_KEY_PROVIDERS (openrouter, minds) are per-user already.
+  const activeProvider = detectProviderSwitch(cleanText) ?? getChannelProvider(contextId);
+  // An OpenRouter key also counts for 'anthropic' — the branch below deliberately
+  // routes Claude through OpenRouter on the user's own credits in that case.
+  const hasOwnKeyForProvider = !!getUserLlmKeyFor(senderId, activeProvider)
+    || (activeProvider === 'anthropic' && !!getUserLlmKeyFor(senderId, 'openrouter'));
+
+  if (HOST_KEY_PROVIDERS.has(activeProvider)
+      && !mayUseHostKey(senderId, username)
+      && !hasOwnKeyForProvider) {
+    const keySource = {
+      anthropic: 'console.anthropic.com',
+      gemini: 'aistudio.google.com/apikey',
+      openai: 'platform.openai.com',
+      hermes: 'portal.nousresearch.com',
+    }[activeProvider] ?? '';
+    await ctx.reply(
+      `🔐 This chat runs on ${activeProvider}, and only the owner (plus anyone they authorize) can use the host's key.\n\n` +
+      `You have three options:\n\n` +
+      `1️⃣ Use your own ${activeProvider} key — DM me:\n` +
+      `   /llm ${activeProvider} <key>\n` +
+      `   Get one at ${keySource}\n\n` +
+      '2️⃣ Use a different provider on your own key — DM me one of:\n' +
+      '   /llm hermes <key> — portal.nousresearch.com (has a free tier)\n' +
+      '   /llm openrouter <key> — openrouter.ai\n' +
+      '   /llm gemini <key> — aistudio.google.com/apikey\n' +
+      '   /llm openai <key> — platform.openai.com\n' +
+      '   ...then say "switch to hermes" (or openrouter/gemini/openai) here.\n\n' +
+      '3️⃣ Ask the bot owner to authorize you to use the host key.'
+    ).catch(() => {});
+    return;
+  }
 
   // ── Provider switch detection ────────────────────────────────────────────────
   const switchTarget = detectProviderSwitch(cleanText);
@@ -2010,6 +2046,15 @@ tg.on(messageFilter('text'), async (ctx) => {
       }
 
       if (handoffText) {
+        // Minds itself is per-user, but executing a confirmed plan hands off to Claude —
+        // which would otherwise fall back to the HOST's Anthropic key. Gate it the same way.
+        if (!anthKey && !mayUseHostKey(senderId, username)) {
+          await editor.finalize(
+            '🔐 Executing this needs Claude, and you\'re not authorized to use the host\'s key.\n\n' +
+            'DM me /llm anthropic <key> to connect your own, or ask the bot owner to authorize you.'
+          );
+          return;
+        }
         accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, anthKey?.apiKey ?? null);
         modelLabel = `${CLAUDE_MODEL} (via Minds)`;
       } else {
