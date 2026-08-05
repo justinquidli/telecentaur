@@ -69,7 +69,7 @@ cp .env.example .env
 | `ANTHROPIC_API_KEY` | ✅ | API key from [console.anthropic.com](https://console.anthropic.com) |
 | `QUIDLI_API_KEY` | ✅ | API key from [connect.quid.li](https://connect.quid.li) |
 | `MASTER_ENCRYPTION_KEY` | ✅ | 64 hex chars (32 bytes) — encrypts stored user API keys. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
-| `BOT_OWNER_ID` | — | Your Telegram user ID — you can trigger drops using the host Quidli wallet without `/connect`. Find it by messaging [@userinfobot](https://t.me/userinfobot). |
+| `BOT_OWNER_ID` | ✅* | Your Telegram user ID. Grants you the host Quidli wallet without `/connect`, **and** is the only account that can use the host's LLM keys by default. Leave it unset and nobody can — every user must bring their own key. Find it by messaging [@userinfobot](https://t.me/userinfobot). |
 | `BRAVE_SEARCH_API_KEY` | — | From [brave.com/search/api](https://brave.com/search/api) — required for web search and conditional drops |
 | `CLAUDE_MODEL` | — | Defaults to `claude-sonnet-4-6` |
 | `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, `openai`, or `hermes` |
