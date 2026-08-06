@@ -329,16 +329,8 @@ db.exec(`CREATE TABLE IF NOT EXISTS user_agents (
 // explicit /name in a DM; everything else keeps today's behaviour, including
 // `switch to X` setting the chat provider. One job per verb, no overlap.
 
-// One-time migration of the single stored Mind into an agent, so anyone already
-// connected keeps that conversation instead of silently starting over. Crude
-// slugging is fine here — re-running /minds registers everything properly.
-db.exec(`INSERT OR IGNORE INTO user_agents
-    (user_id, agent_name, kind, mind_id, alias, alias_at, description)
-  SELECT telegram_id,
-         substr(replace(replace(lower(minds_name), ' ', '_'), '-', '_'), 1, 32),
-         'minds', minds_mind_id, minds_alias, minds_alias_created_at, minds_name
-  FROM user_keys
-  WHERE minds_mind_id IS NOT NULL AND minds_alias IS NOT NULL AND minds_name IS NOT NULL`);
+// (Migration of any pre-existing single Mind into an agent runs further down,
+//  once the slugging helpers it needs are defined.)
 
 function getUserApiKey(telegramId) {
   const row = db.prepare('SELECT api_key FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
@@ -626,6 +618,37 @@ function mintSessionKey(telegramId) {
 // under a synthetic provider so it never sits plaintext on the agent row.
 function endpointKeyProvider(agentName) {
   return `endpoint:${agentName}`;
+}
+
+// One-time migration of a pre-agent Minds connection into an agent, so anyone
+// already connected keeps that conversation instead of silently starting over.
+// Done in JS rather than SQL so it uses the real slugger — names like
+// "justin.quidli" need the dot stripped or the resulting command is unreachable.
+// mind_id is NOT required: it was added by a later ALTER, so older connections
+// have alias + name with a NULL mind_id. The alias is what sends messages;
+// mind_id is only needed to rotate it.
+try {
+  const legacy = db.prepare(`SELECT telegram_id, minds_name, minds_mind_id, minds_alias, minds_alias_created_at
+    FROM user_keys WHERE minds_alias IS NOT NULL AND minds_name IS NOT NULL`).all();
+  for (const row of legacy) {
+    const already = db.prepare("SELECT 1 FROM user_agents WHERE user_id = ? AND kind = 'minds' AND alias = ?")
+      .get(String(row.telegram_id), row.minds_alias);
+    if (already) continue;
+    let name = normalizeAgentName(row.minds_name) || `mind_${String(row.telegram_id).slice(-4)}`;
+    // Don't shadow a stock provider agent or a bot command.
+    if (STOCK_AGENTS[name] || RESERVED_AGENT_NAMES.has(name)) name = `${name}_mind`.slice(0, 32);
+    let unique = name, n = 2;
+    while (db.prepare('SELECT 1 FROM user_agents WHERE user_id = ? AND agent_name = ?')
+      .get(String(row.telegram_id), unique)) unique = `${name}_${n++}`.slice(0, 32);
+    db.prepare(`INSERT OR IGNORE INTO user_agents
+        (user_id, agent_name, kind, mind_id, alias, alias_at, description)
+      VALUES (?, ?, 'minds', ?, ?, ?, ?)`)
+      .run(String(row.telegram_id), unique, row.minds_mind_id ?? null,
+           row.minds_alias, row.minds_alias_created_at ?? null, row.minds_name);
+    console.log(`[migrate] Mind "${row.minds_name}" → /${unique} for ${row.telegram_id}`);
+  }
+} catch (err) {
+  console.error('[migrate] Minds → agents failed (non-fatal):', err.message);
 }
 
 // Switching providers always resets the model (null unless a specific model was named)
@@ -1754,7 +1777,9 @@ const MINDS_ALIAS_MAX_AGE_S = 4 * 60 * 60; // rotate conversation thread every 4
 // what keeps their conversations separate.
 async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderId, agent) {
   const apiKey = getMindsBuilderKey(senderId);
-  if (!apiKey || !agent?.mind_id) {
+  // The alias is what sends — mind_id is only needed to rotate, and older
+  // connections legitimately don't have one.
+  if (!apiKey || !agent?.alias) {
     await tg.telegram.editMessageText(chatId, pendingMsgId, null,
       '⚠️ You need to connect your Minds agent.\nDM me /minds <builder-api-key> to connect.\nGet a Builder API key at https://build.hellominds.ai/console'
     ).catch(() => {});
@@ -1767,7 +1792,7 @@ async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderI
   // Rotate alias if older than 4 hours to prevent Minds falling back to email.
   // Rotation starts a fresh thread on the Minds side — a constraint of theirs,
   // not a choice of ours.
-  if (agent.alias_at) {
+  if (agent.mind_id && agent.alias_at) {
     const ageS = Math.floor(Date.now() / 1000) - agent.alias_at;
     if (ageS > MINDS_ALIAS_MAX_AGE_S) {
       try {
