@@ -620,6 +620,27 @@ function endpointKeyProvider(agentName) {
   return `endpoint:${agentName}`;
 }
 
+// Levenshtein — used only to catch a mistyped agent name before it falls
+// through to the chat provider and gets answered by the wrong thing.
+function editDistance(a, b) {
+  if (a === b) return 0;
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let last = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(
+        prev[j] + 1,
+        prev[j - 1] + 1,
+        last + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+      last = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
 // One-time migration of a pre-agent Minds connection into an agent, so anyone
 // already connected keeps that conversation instead of silently starting over.
 // Done in JS rather than SQL so it uses the real slugger — names like
@@ -718,6 +739,35 @@ const anthropicHistories = new Map();
 const geminiHistories    = new Map();
 const openaiHistories    = new Map();
 const MAX_HISTORY = 40;
+
+// ── Shared chat digest ────────────────────────────────────────────────────────
+// Each agent keeps its own conversation, which is what makes them feel separate —
+// but it also means one can't answer "what did I just send?" or "are you the same
+// as above?". This is a short, read-only view of recent turns in the chat, handed
+// to agents as context only. Deliberately in memory and deliberately small: it's
+// recent context, not history, and it must never dominate the actual message.
+const chatDigests = new Map();
+const DIGEST_TURNS = 6;
+const DIGEST_CHARS = 220;
+
+function recordDigest(contextId, who, text) {
+  const clean = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!clean) return;
+  const log = chatDigests.get(String(contextId)) ?? [];
+  log.push({ who, text: clean.slice(0, DIGEST_CHARS) });
+  if (log.length > DIGEST_TURNS) log.splice(0, log.length - DIGEST_TURNS);
+  chatDigests.set(String(contextId), log);
+}
+
+// Everything except the turn being answered right now — an agent shouldn't see
+// its own prompt twice.
+function buildDigest(contextId, excludeLast = true) {
+  const log = chatDigests.get(String(contextId)) ?? [];
+  const rows = excludeLast ? log.slice(0, -1) : log;
+  if (rows.length === 0) return '';
+  return '[Recent messages in this chat, for context only — these were not addressed to you:]\n'
+    + rows.map((r) => `${r.who}: ${r.text}`).join('\n');
+}
 
 // Hard bound on tool round-trips per user message. Without this the provider loops
 // are `while (true)` and a model that keeps emitting tool calls never terminates —
@@ -1838,7 +1888,14 @@ async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderI
       responseText = stripHtml(outcome.reply?.messageText || '(no response)');
     }
 
-    const finalText = `${responseText}\n— Minds (${mindName})`;
+    // Same shape as the LLM path's label, so a renamed agent still reads clearly:
+    // "tim · Minds (justinahn)" rather than losing the name you actually use.
+    const label = mindName && mindName !== agent.agent_name
+      ? `${agent.agent_name} · Minds (${mindName})`
+      : `${agent.agent_name} · Minds`;
+    // Digest is keyed on the chat, not the agent's history key.
+    recordDigest(String(chatId), `/${agent.agent_name}`, responseText);
+    const finalText = `${responseText}\n— ${label}`;
     const chunks = chunkText(finalText);
     await tg.telegram.editMessageText(chatId, pendingMsgId, null, chunks[0] ?? '…').catch(() => {});
     for (let i = 1; i < chunks.length; i++) {
@@ -2319,6 +2376,19 @@ tg.on(messageFilter('text'), async (ctx) => {
   if (isPrivate) {
     const m = cleanText.match(/^\/([a-z0-9_]{1,32})(?:@\S+)?(?:\s+([\s\S]*))?$/i);
     const candidate = m && getAgent(senderId, m[1]);
+    // A mistyped agent name must not silently fall through to the chat provider —
+    // you'd get a confident answer from something you didn't address.
+    if (m && !candidate) {
+      const typed = m[1].toLowerCase();
+      const near = listAgents(senderId)
+        .map((a) => ({ name: a.agent_name, d: editDistance(typed, a.agent_name) }))
+        .filter((x) => x.d <= Math.max(2, Math.floor(x.name.length / 4)))
+        .sort((a, b) => a.d - b.d)[0];
+      if (near) {
+        await ctx.reply(`No agent called /${m[1]}. Did you mean /${near.name}?`).catch(() => {});
+        return;
+      }
+    }
     if (candidate) {
       agent = candidate;
       agentText = (m[2] ?? '').trim();
@@ -2450,7 +2520,13 @@ tg.on(messageFilter('text'), async (ctx) => {
   const now = new Date();
   const timeContext = `[Current date and time: ${now.toUTCString()} | Local ISO: ${now.toISOString()}]`;
   const senderContext = `[Sent by @${username} (Telegram ID: ${senderId})]`;
-  const contextualText = `${timeContext}\n${senderContext} ${walletNote}\n${agentText}`;
+  // Log this turn, then build the digest excluding it.
+  recordDigest(contextId, agent ? `you → /${agent.agent_name}` : 'you', agentText);
+  const digest = agent ? buildDigest(contextId) : '';
+
+  const contextualText = `${timeContext}\n${senderContext} ${walletNote}\n`
+    + (digest ? `${digest}\n\n` : '')
+    + agentText;
 
   const toolCtx = {
     senderId,
@@ -2614,6 +2690,7 @@ tg.on(messageFilter('text'), async (ctx) => {
     _pendingBasescanUrls.length = 0;
 
     finalText += `\n— ${modelLabel}`;
+    if (agent) recordDigest(contextId, `/${agent.agent_name}`, accumulated);
     await editor.finalize(finalText);
 
   } catch (err) {
