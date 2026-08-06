@@ -115,6 +115,40 @@ test('host key is owner + allowlist only, and fails closed', () => {
   assert.equal(may('999', 'x'), false, 'no owner configured still denies');
 });
 
+// ── Naming ───────────────────────────────────────────────────────────────────
+test('/hermes still resolves to the renamed /nous, without listing twice', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA.agents);
+  const env = build(
+    [grabConst('const STOCK_AGENTS = \\{'), grabConst('const AGENT_NAME_ALIASES = \\{'),
+     grab('normalizeAgentName'), grab('getAgent'), grab('listAgents')].join('\n'),
+    '{ getAgent, listAgents }', { db });
+
+  assert.equal(env.getAgent('u1', 'nous').provider, 'hermes', 'the visible name');
+  assert.equal(env.getAgent('u1', 'hermes').agent_name, 'nous', 'old name still works');
+  assert.equal(env.getAgent('u1', 'nonsense'), null);
+
+  const names = env.listAgents('u1').map((a) => a.agent_name);
+  assert.ok(names.includes('nous'));
+  assert.ok(!names.includes('hermes'), 'the alias must not appear as a second entry');
+
+  // A user's own agent named hermes must win over the alias.
+  db.exec(`INSERT INTO user_agents (user_id, agent_name, kind, provider)
+    VALUES ('u2','hermes','llm','anthropic')`);
+  assert.equal(env.getAgent('u2', 'hermes').provider, 'anthropic', 'own agent beats the alias');
+});
+
+test('provider labels never show the raw internal id', () => {
+  const providerLabel = build(
+    [grabConst('const PROVIDER_LABELS = \\{'), 'const providerLabel = (p) => PROVIDER_LABELS[p] ?? p;'].join('\n'),
+    'providerLabel');
+  // Regression: /agents read "hermes · tencent/hy3:free" — neither Hermes nor Nous.
+  assert.equal(providerLabel('hermes'), 'Nous Portal');
+  assert.equal(providerLabel('anthropic'), 'Anthropic');
+  assert.equal(providerLabel('openrouter'), 'OpenRouter');
+  assert.equal(providerLabel('unknown'), 'unknown', 'falls back rather than showing blank');
+});
+
 // ── Switch precedence ────────────────────────────────────────────────────────
 test('switch phrases keep their meaning; agent names extend them', () => {
   const db = new DatabaseSync(':memory:');
@@ -122,7 +156,7 @@ test('switch phrases keep their meaning; agent names extend them', () => {
   db.exec(`INSERT INTO user_agents (user_id, agent_name, kind) VALUES ('u1','tim','minds')`);
 
   const env = build(
-    [grabConst('const STOCK_AGENTS = \\{'), grab('normalizeAgentName'), grab('getAgent'),
+    [grabConst('const STOCK_AGENTS = \\{'), grabConst('const AGENT_NAME_ALIASES = \\{'), grab('normalizeAgentName'), grab('getAgent'),
      grab('detectProviderSwitch'), grab('detectAgentSwitch')].join('\n'),
     '{ detectProviderSwitch, detectAgentSwitch }', { db });
 
@@ -135,6 +169,11 @@ test('switch phrases keep their meaning; agent names extend them', () => {
   assert.deepEqual(route('switch to hermes'), { kind: 'provider', target: 'hermes' });
   assert.deepEqual(route('switch to kimi'), { kind: 'provider', target: 'openrouter' });
   assert.deepEqual(route('switch to minds'), { kind: 'provider', target: 'minds' });
+
+  // Both names reach Nous Portal, and both take the provider path — the stock
+  // /nous agent must not shadow the provider phrase.
+  assert.deepEqual(route('switch to nous'), { kind: 'provider', target: 'hermes' });
+  assert.deepEqual(route('nous mode'), { kind: 'provider', target: 'hermes' });
 
   assert.deepEqual(route('switch to tim'), { kind: 'agent', target: 'tim' });
   assert.deepEqual(route('use tim'), { kind: 'agent', target: 'tim' });
@@ -155,7 +194,7 @@ test('legacy Minds migrate once and are adopted, not duplicated', () => {
   const s = SRC.indexOf('try {\n  const legacy = db.prepare');
   const migration = SRC.slice(s, SRC.indexOf('\n}', SRC.indexOf('[migrate] Minds → agents failed', s)) + 2);
   const env = build(
-    [grabConst('const STOCK_AGENTS = \\{'), grabConst('const RESERVED_AGENT_NAMES = new Set\\(\\['),
+    [grabConst('const STOCK_AGENTS = \\{'), grabConst('const AGENT_NAME_ALIASES = \\{'), grabConst('const RESERVED_AGENT_NAMES = new Set\\(\\['),
      grab('normalizeAgentName'), grab('getAgent'), grab('listAgents'), grab('upsertAgent')].join('\n'),
     '{ boot(){ ' + migration + ' }, listAgents, upsertAgent, normalizeAgentName }',
     { db, console: { log() {}, error() {} } });
@@ -198,7 +237,7 @@ test('a Mind named after a stock provider cannot shadow it', () => {
 
   const s = SRC.indexOf('try {\n  const legacy = db.prepare');
   const migration = SRC.slice(s, SRC.indexOf('\n}', SRC.indexOf('[migrate] Minds → agents failed', s)) + 2);
-  build([grabConst('const STOCK_AGENTS = \\{'), grabConst('const RESERVED_AGENT_NAMES = new Set\\(\\['),
+  build([grabConst('const STOCK_AGENTS = \\{'), grabConst('const AGENT_NAME_ALIASES = \\{'), grabConst('const RESERVED_AGENT_NAMES = new Set\\(\\['),
     grab('normalizeAgentName')].join('\n'), '(function(){' + migration + '})()',
     { db, console: { log() {}, error() {} } });
 

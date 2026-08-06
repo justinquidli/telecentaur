@@ -425,8 +425,28 @@ const STOCK_AGENTS = {
   claude:     { kind: 'llm', provider: 'anthropic' },
   gemini:     { kind: 'llm', provider: 'gemini' },
   openai:     { kind: 'llm', provider: 'openai' },
-  hermes:     { kind: 'llm', provider: 'hermes' },
+  nous:       { kind: 'llm', provider: 'hermes' },
   openrouter: { kind: 'llm', provider: 'openrouter' },
+};
+
+// The internal provider id stays 'hermes' so stored keys and chat settings keep
+// resolving, but it points at Nous Portal and usually runs a non-Nous model, so
+// showing "hermes" to users was simply wrong. Display names live here.
+const PROVIDER_LABELS = {
+  anthropic: 'Anthropic',
+  gemini: 'Gemini',
+  openai: 'OpenAI',
+  hermes: 'Nous Portal',
+  openrouter: 'OpenRouter',
+  endpoint: 'agent endpoint',
+  minds: 'Minds',
+};
+const providerLabel = (p) => PROVIDER_LABELS[p] ?? p;
+
+// /hermes was the old name for what is now /nous. Kept resolving so anything
+// typed before — or stored in chat_settings — still works, without listing both.
+const AGENT_NAME_ALIASES = {
+  hermes: 'nous',
 };
 
 // Names double as Telegram commands, so they must be lowercase a-z0-9_ and <=32.
@@ -464,11 +484,13 @@ function defaultModelForProvider(provider) {
 }
 
 function getAgent(userId, name) {
-  const agentName = normalizeAgentName(name);
+  let agentName = normalizeAgentName(name);
   if (!agentName) return null;
   const row = db.prepare('SELECT * FROM user_agents WHERE user_id = ? AND agent_name = ?')
     .get(String(userId), agentName);
   if (row) return row;
+  // Only alias to a stock agent — a user's own /hermes must still be their own.
+  if (AGENT_NAME_ALIASES[agentName]) agentName = AGENT_NAME_ALIASES[agentName];
   const stock = STOCK_AGENTS[agentName];
   if (!stock) return null;
   return { user_id: String(userId), agent_name: agentName, ...stock, model: null, is_stock: 1 };
@@ -542,7 +564,7 @@ function describeAgent(agent) {
   if (agent.kind === 'minds') return `Minds · ${agent.description || agent.agent_name}`;
   if (agent.base_url) return `agent endpoint${agent.model && agent.model !== 'hermes-agent' ? ` · ${agent.model}` : ''}`;
   const model = agent.model || defaultModelForProvider(agent.provider) || 'your key\'s default';
-  return `${agent.provider} · ${model}`;
+  return `${providerLabel(agent.provider)} · ${model}`;
 }
 
 // The Minds builder key is one-per-user and covers every Mind on the account,
@@ -646,8 +668,11 @@ try {
       .get(String(row.telegram_id));
     if (already) continue;
     let name = normalizeAgentName(row.minds_name) || `mind_${String(row.telegram_id).slice(-4)}`;
-    // Don't shadow a stock provider agent or a bot command.
-    if (STOCK_AGENTS[name] || RESERVED_AGENT_NAMES.has(name)) name = `${name}_mind`.slice(0, 32);
+    // Don't shadow a stock agent, one of its aliases, or a bot command — a Mind
+    // named "Hermes" must not quietly take over /hermes.
+    if (STOCK_AGENTS[name] || AGENT_NAME_ALIASES[name] || RESERVED_AGENT_NAMES.has(name)) {
+      name = `${name}_mind`.slice(0, 32);
+    }
     let unique = name, n = 2;
     while (db.prepare('SELECT 1 FROM user_agents WHERE user_id = ? AND agent_name = ?')
       .get(String(row.telegram_id), unique)) unique = `${name}_${n++}`.slice(0, 32);
@@ -2040,8 +2065,10 @@ tg.command('minds', async (ctx) => {
     for (const mind of enabled) {
       let name = normalizeAgentName(mind.name);
       if (!name) name = `mind_${String(mind.mindId).slice(0, 6).toLowerCase()}`;
-      // Don't shadow a bot command or an agent that already points elsewhere.
-      if (RESERVED_AGENT_NAMES.has(name)) name = `${name}_mind`.slice(0, 32);
+      // Don't shadow a bot command, a stock agent, or one of its aliases.
+      if (STOCK_AGENTS[name] || AGENT_NAME_ALIASES[name] || RESERVED_AGENT_NAMES.has(name)) {
+        name = `${name}_mind`.slice(0, 32);
+      }
 
       // Match this Mind to an agent we already have: by mind_id normally, but
       // also by name when mind_id is NULL — that's a migrated pre-agent Mind,
@@ -2165,7 +2192,7 @@ tg.command('agent', async (ctx) => {
     }
     return ctx.reply(`What should /${name} run on?`, {
       reply_markup: {
-        inline_keyboard: options.map((p) => [{ text: p, callback_data: `agentnew:${name}:${p}` }]),
+        inline_keyboard: options.map((p) => [{ text: providerLabel(p), callback_data: `agentnew:${name}:${p}` }]),
       },
     });
   }
@@ -2271,9 +2298,11 @@ tg.action(/^agentnew:([a-z0-9_]{1,32}):([a-z]+)$/, async (ctx) => {
 tg.command('llm', async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   const parts = ctx.message.text.replace('/llm', '').trim().split(/\s+/);
-  const provider = parts[0]?.toLowerCase();
+  // 'nous' is the name users see (/nous, "switch to nous"); 'hermes' remains the
+  // stored id and keeps working for anyone who learned it that way.
+  const provider = ({ nous: 'hermes' })[parts[0]?.toLowerCase()] ?? parts[0]?.toLowerCase();
   const apiKey = parts[1];
-  const model = parts[2] || null; // optional, used for openrouter and hermes
+  const model = parts[2] || null; // optional, used for openrouter and nous
 
   if (!provider || !apiKey) {
     return ctx.reply(
@@ -2283,30 +2312,31 @@ tg.command('llm', async (ctx) => {
       '  gemini     — from aistudio.google.com/apikey\n' +
       '  openai     — from platform.openai.com\n' +
       '  openrouter — from openrouter.ai (access 100+ models)\n' +
-      '  hermes     — from portal.nousresearch.com (API keys)\n\n' +
-      'For OpenRouter and Hermes, you can optionally specify a model:\n' +
+      '  nous       — Nous Portal, from portal.nousresearch.com (API keys)\n\n' +
+      'For OpenRouter and Nous Portal you can also name a model:\n' +
       '  /llm openrouter <key> [model]\n' +
       '  Example: /llm openrouter sk-or-... meta-llama/llama-3-70b-instruct\n' +
       '  Default model: openai/gpt-4o\n' +
-      '  /llm hermes <key> [model]\n' +
-      '  Example: /llm hermes sk-... tencent/hy3:free  (free tier)\n' +
+      '  /llm nous <key> [model]\n' +
+      '  Example: /llm nous sk-... tencent/hy3:free  (free tier)\n' +
       '  Nous Portal proxies 200+ models — see portal.nousresearch.com/info\n\n' +
       'Your key is stored encrypted and used instead of the host key. DM /llm_remove to disconnect.'
     );
   }
 
   if (!['anthropic', 'gemini', 'openai', 'openrouter', 'hermes'].includes(provider)) {
-    return ctx.reply('Unknown provider. Use: anthropic, gemini, openai, openrouter, or hermes');
+    return ctx.reply('Unknown provider. Use: anthropic, gemini, openai, openrouter, or nous');
   }
 
   setUserLlmKey(ctx.from.id, provider, apiKey, model);
   const modelNote = provider === 'openrouter' ? ` (model: ${model || 'openai/gpt-4o'})`
     : provider === 'hermes' ? ` (model: ${model || NOUS_MODEL})`
     : '';
+  const shown = provider === 'hermes' ? 'nous' : provider;
   ctx.reply(
-    `✅ Connected your ${provider} key${modelNote}.\n\n` +
-    `This applies wherever a chat is running on ${provider}. If a chat is on a different ` +
-    `provider, say "switch to ${provider}" there first — then it'll run on your own credits.\n\n` +
+    `✅ Connected your ${providerLabel(provider)} key${modelNote}.\n\n` +
+    `This applies wherever a chat is running on ${providerLabel(provider)}. If a chat is on a different ` +
+    `provider, say "switch to ${shown}" there first — then it'll run on your own credits.\n\n` +
     '⚠️ Your key is stored encrypted. DM /llm_remove anytime to disconnect.'
   );
 });
@@ -2474,17 +2504,17 @@ tg.on(messageFilter('text'), async (ctx) => {
       hermes: 'portal.nousresearch.com',
     }[activeProvider] ?? '';
     await ctx.reply(
-      `🔐 This chat runs on ${activeProvider}, and only the owner (plus anyone they authorize) can use the host's key.\n\n` +
+      `🔐 This chat runs on ${providerLabel(activeProvider)}, and only the owner (plus anyone they authorize) can use the host's key.\n\n` +
       `You have three options:\n\n` +
-      `1️⃣ Use your own ${activeProvider} key — DM me:\n` +
+      `1️⃣ Use your own ${providerLabel(activeProvider)} key — DM me:\n` +
       `   /llm ${activeProvider} <key>\n` +
       `   Get one at ${keySource}\n\n` +
       '2️⃣ Use a different provider on your own key — DM me one of:\n' +
-      '   /llm hermes <key> — portal.nousresearch.com (has a free tier)\n' +
+      '   /llm hermes <key> — Nous Portal, portal.nousresearch.com (has a free tier)\n' +
       '   /llm openrouter <key> — openrouter.ai\n' +
       '   /llm gemini <key> — aistudio.google.com/apikey\n' +
       '   /llm openai <key> — platform.openai.com\n' +
-      '   ...then say "switch to hermes" (or openrouter/gemini/openai) here.\n\n' +
+      '   ...then say "switch to nous" (or openrouter/gemini/openai) here.\n\n' +
       '3️⃣ Ask the bot owner to authorize you to use the host key.'
     ).catch(() => {});
     return;
@@ -2803,7 +2833,7 @@ tg.launch({
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER}`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
   if (OPENAI_API_KEY) console.log(`   OpenAI: ${OPENAI_MODEL} ✓`);
-  if (NOUS_API_KEY) console.log(`   Hermes: ${NOUS_MODEL} ✓ (via Nous Portal — 200+ models, per-user override with /llm hermes <key> <model>)`);
+  if (NOUS_API_KEY) console.log(`   Nous Portal: ${NOUS_MODEL} ✓ (200+ models, per-user override with /llm nous <key> <model>)`);
   console.log(`   Minds: per-user keys (DM /minds <key> to register)`);
   console.log(`   Quidli: ${QUIDLI_API_KEY ? 'API key' : 'x402 payments'}`);
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
