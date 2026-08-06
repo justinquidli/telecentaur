@@ -652,8 +652,12 @@ try {
   const legacy = db.prepare(`SELECT telegram_id, minds_name, minds_mind_id, minds_alias, minds_alias_created_at
     FROM user_keys WHERE minds_alias IS NOT NULL AND minds_name IS NOT NULL`).all();
   for (const row of legacy) {
-    const already = db.prepare("SELECT 1 FROM user_agents WHERE user_id = ? AND kind = 'minds' AND alias = ?")
-      .get(String(row.telegram_id), row.minds_alias);
+    // Idempotency must NOT key on the alias: /minds re-registration legitimately
+    // replaces it, after which an alias-based check stops matching and this
+    // migration re-fires on every restart, creating _2, _3, _4… Bootstrapping is
+    // only for users with no Minds agents at all.
+    const already = db.prepare("SELECT 1 FROM user_agents WHERE user_id = ? AND kind = 'minds' LIMIT 1")
+      .get(String(row.telegram_id));
     if (already) continue;
     let name = normalizeAgentName(row.minds_name) || `mind_${String(row.telegram_id).slice(-4)}`;
     // Don't shadow a stock provider agent or a bot command.
@@ -2027,15 +2031,21 @@ tg.command('minds', async (ctx) => {
       if (!name) name = `mind_${String(mind.mindId).slice(0, 6).toLowerCase()}`;
       // Don't shadow a bot command or an agent that already points elsewhere.
       if (RESERVED_AGENT_NAMES.has(name)) name = `${name}_mind`.slice(0, 32);
-      const existing = getAgent(ctx.from.id, name);
-      if (taken.has(name) && existing?.mind_id && existing.mind_id !== mind.mindId) {
+
+      // Match this Mind to an agent we already have: by mind_id normally, but
+      // also by name when mind_id is NULL — that's a migrated pre-agent Mind,
+      // and adopting it keeps its conversation instead of orphaning the alias.
+      const mine = listAgents(ctx.from.id).filter((a) => a.kind === 'minds');
+      const already = mine.find((a) => a.mind_id === mind.mindId)
+        ?? mine.find((a) => !a.mind_id && a.agent_name === name);
+      if (already) name = already.agent_name;
+
+      if (!already && taken.has(name)) {
         let n = 2;
         while (taken.has(`${name}_${n}`.slice(0, 32))) n++;
         name = `${name}_${n}`.slice(0, 32);
       }
 
-      // Reuse an alias we already minted for this Mind so its thread survives.
-      const already = listAgents(ctx.from.id).find((a) => a.mind_id === mind.mindId);
       const alias = already?.alias ?? mintMindsAlias(ctx.from.id);
       try {
         if (!already?.alias) await client.ensureConversation(alias, mind.mindId);
