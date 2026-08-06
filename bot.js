@@ -293,9 +293,35 @@ db.exec(`CREATE TABLE IF NOT EXISTS chat_settings (
 )`);
 // Chat-level model override (e.g. "switch to fable" / "switch to kimi") — for upgrades
 try { db.exec(`ALTER TABLE chat_settings ADD COLUMN model TEXT`); } catch { }
-// Which agent unprefixed messages go to, set by "switch to <agent name>".
-// NULL means the chat behaves exactly as it did before agents existed.
+// Superseded by chat_user_agent below — kept so existing rows don't error.
 try { db.exec(`ALTER TABLE chat_settings ADD COLUMN agent_name TEXT`); } catch { }
+
+// Which agent a member's unprefixed messages go to, per chat. Keyed by user as
+// well as chat because agents are owned per-user: in a group, your default is
+// yours and can't be changed or cleared by anyone else speaking.
+// Agents in a group read the recent channel digest, which means one member's
+// messages reach whatever model another member chose, on their key. That's a
+// disclosure, so the room gets told once — tracked here so it fires exactly once.
+db.exec(`CREATE TABLE IF NOT EXISTS chat_agent_notice (
+  context_id TEXT PRIMARY KEY,
+  notified_at INTEGER DEFAULT (unixepoch())
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS chat_user_agent (
+  context_id TEXT NOT NULL,
+  user_id    TEXT NOT NULL,
+  agent_name TEXT NOT NULL,
+  updated_at INTEGER DEFAULT (unixepoch()),
+  PRIMARY KEY (context_id, user_id)
+)`);
+// Carry over any chat-wide default set before this was per-user. Safe because
+// agents were DM-only until now, so context_id identifies exactly one user.
+try {
+  db.exec(`INSERT OR IGNORE INTO chat_user_agent (context_id, user_id, agent_name)
+    SELECT context_id, context_id, agent_name FROM chat_settings WHERE agent_name IS NOT NULL`);
+} catch (err) {
+  console.error('[migrate] chat default agent → per-user failed (non-fatal):', err.message);
+}
 db.exec(`CREATE TABLE IF NOT EXISTS chat_members (
   chat_id    TEXT NOT NULL,
   user_id    TEXT NOT NULL,
@@ -545,7 +571,8 @@ function renameAgent(userId, from, to) {
   db.prepare('UPDATE user_agents SET agent_name = ? WHERE user_id = ? AND agent_name = ?')
     .run(to, String(userId), from);
   // Follow the rename so a chat pointed at this agent doesn't strand itself.
-  db.prepare('UPDATE chat_settings SET agent_name = ? WHERE agent_name = ?').run(to, from);
+  db.prepare('UPDATE chat_user_agent SET agent_name = ? WHERE user_id = ? AND agent_name = ?')
+    .run(to, String(userId), from);
   // An endpoint agent's bearer token is filed under its name — move it too, or
   // the renamed agent silently loses auth.
   db.prepare('UPDATE user_llm_keys SET provider = ? WHERE user_id = ? AND provider = ?')
@@ -556,6 +583,21 @@ function deleteAgent(userId, agentName) {
   db.prepare('DELETE FROM user_agents WHERE user_id = ? AND agent_name = ?').run(String(userId), agentName);
   db.prepare('DELETE FROM user_llm_keys WHERE user_id = ? AND provider = ?')
     .run(String(userId), `endpoint:${agentName}`);
+  db.prepare('DELETE FROM chat_user_agent WHERE user_id = ? AND agent_name = ?')
+    .run(String(userId), agentName);
+}
+
+// In a group, two people can both own an agent called "tim", so a reply has to
+// say whose it is. In a DM there's only one owner, so the tag is noise.
+function agentTag(agent, ownerName, isPrivate) {
+  return isPrivate ? agent.agent_name : `${agent.agent_name} (@${ownerName})`;
+}
+
+// True the first time an agent is used in a given group, so the room can be
+// told once that agents here can read recent messages.
+function claimAgentNotice(contextId) {
+  return db.prepare('INSERT OR IGNORE INTO chat_agent_notice (context_id) VALUES (?)')
+    .run(String(contextId)).changes > 0;
 }
 
 // Human-readable backing, used in /agents and the reply label.
@@ -699,16 +741,25 @@ function setChannelProvider(contextId, provider, model = null) {
 }
 
 // "switch to tim" — unprefixed messages go to that agent until you switch away.
-function setChannelAgent(contextId, agentName) {
-  db.prepare(`INSERT INTO chat_settings (context_id, provider, agent_name, updated_at)
-    VALUES (?, COALESCE((SELECT provider FROM chat_settings WHERE context_id = ?), 'anthropic'), ?, unixepoch())
-    ON CONFLICT(context_id) DO UPDATE SET agent_name = excluded.agent_name, updated_at = unixepoch()`)
-    .run(String(contextId), String(contextId), agentName);
+// Scoped per (chat, user): agents are owned per-user, so in a group your default
+// is yours. A chat-wide value would mean one member's message resolves against
+// their own agents and wipes everyone else's.
+function setChannelAgent(contextId, userId, agentName) {
+  if (!agentName) {
+    db.prepare('DELETE FROM chat_user_agent WHERE context_id = ? AND user_id = ?')
+      .run(String(contextId), String(userId));
+    return;
+  }
+  db.prepare(`INSERT INTO chat_user_agent (context_id, user_id, agent_name, updated_at)
+    VALUES (?, ?, ?, unixepoch())
+    ON CONFLICT(context_id, user_id) DO UPDATE SET agent_name = excluded.agent_name,
+      updated_at = unixepoch()`)
+    .run(String(contextId), String(userId), agentName);
 }
 
-function getChannelAgentName(contextId) {
-  return db.prepare('SELECT agent_name FROM chat_settings WHERE context_id = ?')
-    .get(String(contextId))?.agent_name ?? null;
+function getChannelAgentName(contextId, userId) {
+  return db.prepare('SELECT agent_name FROM chat_user_agent WHERE context_id = ? AND user_id = ?')
+    .get(String(contextId), String(userId))?.agent_name ?? null;
 }
 
 // Only consulted when detectProviderSwitch found nothing, so every existing
@@ -1865,7 +1916,7 @@ const MINDS_ALIAS_MAX_AGE_S = 4 * 60 * 60; // rotate conversation thread every 4
 // Takes the agent to run rather than resolving a single stored Mind, so several
 // Minds can be addressed independently. Each agent owns its own alias, which is
 // what keeps their conversations separate.
-async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderId, agent) {
+async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderId, agent, ownerTag) {
   const apiKey = getMindsBuilderKey(senderId);
   // The alias is what sends — mind_id is only needed to rotate, and older
   // connections legitimately don't have one.
@@ -1930,11 +1981,12 @@ async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderI
 
     // Same shape as the LLM path's label, so a renamed agent still reads clearly:
     // "tim · Minds (justinahn)" rather than losing the name you actually use.
+    const shownName = ownerTag || agent.agent_name;
     const label = mindName && mindName !== agent.agent_name
-      ? `${agent.agent_name} · Minds (${mindName})`
-      : `${agent.agent_name} · Minds`;
+      ? `${shownName} · Minds (${mindName})`
+      : `${shownName} · Minds`;
     // Digest is keyed on the chat, not the agent's history key.
-    recordDigest(String(chatId), `/${agent.agent_name}`, responseText);
+    recordDigest(String(chatId), `/${ownerTag || agent.agent_name}`, responseText);
     const finalText = `${responseText}\n— ${label}`;
     const chunks = chunkText(finalText);
     await tg.telegram.editMessageText(chatId, pendingMsgId, null, chunks[0] ?? '…').catch(() => {});
@@ -2136,7 +2188,7 @@ tg.command('agents', async (ctx) => {
   const mine = agents.filter((a) => !a.is_stock);
   const stock = agents.filter((a) => a.is_stock);
 
-  const current = getChannelAgentName(ctx.chat.id);
+  const current = getChannelAgentName(ctx.chat.id, ctx.from.id);
   const fmt = (a) => `/${a.agent_name} — ${describeAgent(a)}`
     + (a.agent_name === current ? '  ← messages go here' : '');
   const provider = getChannelProvider(String(ctx.chat.id));
@@ -2390,11 +2442,17 @@ tg.on(messageFilter('text'), async (ctx) => {
   const isMentioned = botUsername && text.includes(`@${botUsername}`);
   const isReplyToBot = msg.reply_to_message?.from?.id === tg.botInfo?.id;
 
+  // …or when the sender addresses one of their own agents by name. Checked on
+  // the raw text before mention-stripping, and resolved against the SENDER, so
+  // in a group your /tim is yours and nobody else can invoke it.
+  const addressedName = text.match(/^\/([a-z0-9_]{1,32})(?:@\S+)?(?:[\s,:;]|$)/i)?.[1];
+  const addressesOwnAgent = !!(addressedName && getAgent(senderId, addressedName));
+
   // Track everyone who messages the bot — in groups (so "everyone" drops work)
   // and in DMs (so resolve_telegram_username can find anyone who's ever messaged the bot directly)
   recordChatMember(chatId, senderId, username);
 
-  if (!isPrivate && !isMentioned && !isReplyToBot) {
+  if (!isPrivate && !isMentioned && !isReplyToBot && !addressesOwnAgent) {
     // Still check watchers even if not mentioned
     await checkWatchers(chatId, senderId, username, text).catch((err) => console.error('[watcher] error:', err.message));
     return;
@@ -2427,13 +2485,15 @@ tg.on(messageFilter('text'), async (ctx) => {
 
   const contextId = String(chatId);
 
-  // ── Agent addressing (DMs only) ──────────────────────────────────────────────
-  // A message starting with /name, where name is one of this user's agents,
+  // ── Agent addressing ─────────────────────────────────────────────────────────
+  // A message starting with /name, where name is one of THIS SENDER's agents,
   // goes to that agent. Anything else — including /foo that isn't an agent —
   // falls through to exactly the behaviour that existed before agents.
+  // Works in groups: agents are owned per-user, so your /tim is yours, runs on
+  // your key, and nobody else in the room can invoke it.
   let agent = null;
   let agentText = cleanText;
-  if (isPrivate) {
+  {
     // Separator after the name may be whitespace or punctuation — "/bob, what's up"
     // and "/bob: hi" are natural to type, and previously matched nothing at all,
     // which sent the message to the chat provider without any warning.
@@ -2455,6 +2515,14 @@ tg.on(messageFilter('text'), async (ctx) => {
     }
     if (candidate) {
       agent = candidate;
+      // First agent use in a group: tell the room what agents can see, once.
+      if (!isPrivate && claimAgentNotice(contextId)) {
+        await ctx.reply(
+          'ℹ️ Agents are now in use here. Each person\'s agent runs on their own API key, and ' +
+          'agents can see recent messages *addressed to an agent* plus agents\' replies — ' +
+          'ordinary chat in this group is not sent to them.'
+        ).catch(() => {});
+      }
       agentText = (m[2] ?? '').trim();
       if (!agentText) {
         // Naming an agent with nothing to say shows its card instead of burning a turn.
@@ -2473,11 +2541,11 @@ tg.on(messageFilter('text'), async (ctx) => {
     // No explicit /name: fall back to the chat's default agent if one is set.
     // Resolved fresh each turn so a deleted or renamed agent can't strand the chat.
     if (!agent) {
-      const fallback = getChannelAgentName(contextId);
+      const fallback = getChannelAgentName(contextId, senderId);
       if (fallback) {
         const resolved = getAgent(senderId, fallback);
         if (resolved) agent = resolved;
-        else setChannelAgent(contextId, null); // it was deleted — quietly revert
+        else setChannelAgent(contextId, senderId, null); // it was deleted — quietly revert
       }
     }
   }
@@ -2530,7 +2598,7 @@ tg.on(messageFilter('text'), async (ctx) => {
   if (!agent && isPrivate && !detectProviderSwitch(cleanText)) {
     const target = detectAgentSwitch(cleanText, senderId);
     if (target) {
-      setChannelAgent(contextId, target);
+      setChannelAgent(contextId, senderId, target);
       const a = getAgent(senderId, target);
       await ctx.reply(
         `🔀 Messages here now go to /${target} — ${describeAgent(a)}.\n` +
@@ -2576,6 +2644,9 @@ tg.on(messageFilter('text'), async (ctx) => {
     }
 
     setChannelProvider(contextId, switchTarget, namedModel);
+    // Switching to a provider means the provider — drop only *your* agent
+    // default, not everyone's, since the chat is shared but agents aren't.
+    setChannelAgent(contextId, senderId, null);
     anthropicHistories.delete(contextId);
     geminiHistories.delete(contextId);
     openaiHistories.delete(contextId);
@@ -2611,7 +2682,9 @@ tg.on(messageFilter('text'), async (ctx) => {
   const timeContext = `[Current date and time: ${now.toUTCString()} | Local ISO: ${now.toISOString()}]`;
   const senderContext = `[Sent by @${username} (Telegram ID: ${senderId})]`;
   // Log this turn, then build the digest excluding it.
-  recordDigest(contextId, agent ? `you → /${agent.agent_name}` : 'you', agentText);
+  // In a group "you" is ambiguous — name the speaker so agents can tell members apart.
+  const speaker = isPrivate ? 'you' : `@${username}`;
+  recordDigest(contextId, agent ? `${speaker} → /${agent.agent_name}` : speaker, agentText);
   const digest = agent ? buildDigest(contextId) : '';
 
   const contextualText = `${timeContext}\n${senderContext} ${walletNote}\n`
@@ -2642,7 +2715,8 @@ tg.on(messageFilter('text'), async (ctx) => {
       // Agents run on their own history key, so each keeps its own thread.
       const aCtx = agentContextId(contextId, agent.agent_name);
       if (agent.kind === 'minds') {
-        runMindsBackground(aCtx, contextualText, chatId, pendingMsg.message_id, senderId, agent)
+        runMindsBackground(aCtx, contextualText, chatId, pendingMsg.message_id, senderId, agent,
+          agentTag(agent, username, isPrivate))
           .catch((err) => console.error('[minds-bg] unhandled:', err.message));
         return;
       }
@@ -2694,7 +2768,7 @@ tg.on(messageFilter('text'), async (ctx) => {
           headers: extraHeaders,
         });
       }
-      modelLabel = `${agent.agent_name} · ${describeAgent(agent)}`;
+      modelLabel = `${agentTag(agent, username, isPrivate)} · ${describeAgent(agent)}`;
     } else if (effectiveProvider === 'gemini') {
       accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx, getUserLlmKeyFor(senderId, 'gemini')?.apiKey ?? null);
       modelLabel = GEMINI_MODEL;
@@ -2808,7 +2882,7 @@ tg.on(messageFilter('text'), async (ctx) => {
     _pendingBasescanUrls.length = 0;
 
     finalText += `\n— ${modelLabel}`;
-    if (agent) recordDigest(contextId, `/${agent.agent_name}`, accumulated);
+    if (agent) recordDigest(contextId, `/${agentTag(agent, username, isPrivate)}`, accumulated);
     await editor.finalize(finalText);
 
   } catch (err) {

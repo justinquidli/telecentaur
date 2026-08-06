@@ -200,6 +200,69 @@ test('switch phrases keep their meaning; agent names extend them', () => {
   assert.equal(route('should i switch to tim or not'), null, 'must not fire mid-sentence');
 });
 
+// ── Multi-owner groups ───────────────────────────────────────────────────────
+test('two members can own same-named agents without collision', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA.agents);
+  db.exec(`INSERT INTO user_agents (user_id, agent_name, kind, provider, description)
+    VALUES ('alice','tim','minds','', 'Alice Mind')`);
+  db.exec(`INSERT INTO user_agents (user_id, agent_name, kind, provider, description)
+    VALUES ('bob','tim','llm','anthropic', NULL)`);
+
+  const env = build(
+    [grabConst('const STOCK_AGENTS = \\{'), grabConst('const AGENT_NAME_ALIASES = \\{'),
+     grab('normalizeAgentName'), grab('getAgent')].join('\n'), '{ getAgent }', { db });
+
+  // The whole ownership model rests on this: resolution is per-sender.
+  assert.equal(env.getAgent('alice', 'tim').kind, 'minds');
+  assert.equal(env.getAgent('bob', 'tim').kind, 'llm');
+  assert.equal(env.getAgent('carol', 'tim'), null, 'a non-owner cannot invoke it at all');
+});
+
+test('one member cannot change or clear another member\'s default agent', () => {
+  // Regression risk: chat_settings.agent_name was chat-wide while agents are
+  // per-user, so in a group anyone speaking would resolve against their own
+  // agents and wipe everyone else's default.
+  const db = new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE chat_user_agent (context_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    agent_name TEXT NOT NULL, updated_at INTEGER, PRIMARY KEY (context_id, user_id))`);
+
+  const env = build([grab('setChannelAgent'), grab('getChannelAgentName')].join('\n'),
+    '{ setChannelAgent, getChannelAgentName }', { db });
+
+  env.setChannelAgent('grp', 'alice', 'tim');
+  env.setChannelAgent('grp', 'bob', 'max');
+  assert.equal(env.getChannelAgentName('grp', 'alice'), 'tim');
+  assert.equal(env.getChannelAgentName('grp', 'bob'), 'max');
+
+  env.setChannelAgent('grp', 'bob', null);           // bob switches back to a provider
+  assert.equal(env.getChannelAgentName('grp', 'bob'), null);
+  assert.equal(env.getChannelAgentName('grp', 'alice'), 'tim', "alice's default survives");
+
+  assert.equal(env.getChannelAgentName('grp', 'carol'), null, 'unset for a third member');
+});
+
+test('the group disclosure fires exactly once per chat', () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE chat_agent_notice (context_id TEXT PRIMARY KEY, notified_at INTEGER)`);
+  const claim = build(grab('claimAgentNotice'), 'claimAgentNotice', { db });
+
+  assert.equal(claim('grp1'), true, 'first use notifies');
+  assert.equal(claim('grp1'), false, 'never again');
+  assert.equal(claim('grp1'), false);
+  assert.equal(claim('grp2'), true, 'a different group notifies separately');
+});
+
+test('replies are attributed to their owner in groups only', () => {
+  const agentTag = build(grab('agentTag'), 'agentTag');
+  assert.equal(agentTag({ agent_name: 'tim' }, 'alice', true), 'tim', 'no noise in a DM');
+  assert.equal(agentTag({ agent_name: 'tim' }, 'alice', false), 'tim (@alice)');
+  // Two people's "tim" must be distinguishable in one room.
+  assert.notEqual(
+    agentTag({ agent_name: 'tim' }, 'alice', false),
+    agentTag({ agent_name: 'tim' }, 'bob', false));
+});
+
 // ── Minds migration ──────────────────────────────────────────────────────────
 test('legacy Minds migrate once and are adopted, not duplicated', () => {
   // Regression: idempotency keyed on the alias, which /minds legitimately
