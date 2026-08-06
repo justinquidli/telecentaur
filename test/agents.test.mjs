@@ -64,13 +64,32 @@ test('agent names are slugged into valid commands', () => {
 
 // ── Addressing ───────────────────────────────────────────────────────────────
 test('/name addressing only matches a leading command', () => {
-  const re = /^\/([a-z0-9_]{1,32})(?:@\S+)?(?:\s+([\s\S]*))?$/i;
+  // Pulled from bot.js so the test can't drift from the shipped pattern.
+  const src = SRC.match(/cleanText\.match\((\/\^\\\/.*?\/i)\)/);
+  assert.ok(src, 'could not find the addressing regex in bot.js');
+  const re = new RegExp(src[1].slice(1, -2), 'i');
+
+  // bot.js does `(m[2] ?? '').trim()`, so test the resulting text, not the raw group.
+  const body = (s) => { const r = re.exec(s); return r ? (r[2] ?? '').trim() : null; };
+  const name = (s) => re.exec(s)?.[1] ?? null;
+
   assert.deepEqual(re.exec('/tim hello').slice(1, 3), ['tim', 'hello']);
-  assert.equal(re.exec('/tim')[2], undefined);
+  assert.equal(body('/tim'), '', 'bare name shows the card');
   assert.deepEqual(re.exec('/tim@TeleCentaurBot hi').slice(1, 3), ['tim', 'hi']);
   assert.deepEqual(re.exec('/tim a\nb').slice(1, 3), ['tim', 'a\nb']);
   assert.equal(re.exec('hello /tim'), null);
-  assert.equal(re.exec('/tim-bob hi'), null);
+  assert.equal(re.exec('/tim-bob hi'), null, 'hyphen stays part of an unknown name');
+
+  // Regression: punctuation after the name matched nothing, so the message went
+  // to the chat provider silently — which then answered as if it were the agent.
+  assert.deepEqual(re.exec('/bob, what is the best eth strategy?').slice(1, 3),
+    ['bob', 'what is the best eth strategy?']);
+  assert.deepEqual(re.exec('/alice, do you agree with /bob?').slice(1, 3),
+    ['alice', 'do you agree with /bob?']);
+  assert.deepEqual(re.exec('/tim: hi').slice(1, 3), ['tim', 'hi']);
+  assert.deepEqual(re.exec('/tim; hi').slice(1, 3), ['tim', 'hi']);
+  assert.equal(name('/tim,'), 'tim');
+  assert.equal(body('/tim,'), '', 'name plus bare punctuation shows the card');
 });
 
 test('each agent gets its own history key', () => {

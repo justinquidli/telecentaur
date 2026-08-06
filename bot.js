@@ -2434,7 +2434,11 @@ tg.on(messageFilter('text'), async (ctx) => {
   let agent = null;
   let agentText = cleanText;
   if (isPrivate) {
-    const m = cleanText.match(/^\/([a-z0-9_]{1,32})(?:@\S+)?(?:\s+([\s\S]*))?$/i);
+    // Separator after the name may be whitespace or punctuation — "/bob, what's up"
+    // and "/bob: hi" are natural to type, and previously matched nothing at all,
+    // which sent the message to the chat provider without any warning.
+    // Hyphen is deliberately excluded so "/tim-bob" stays a single unknown name.
+    const m = cleanText.match(/^\/([a-z0-9_]{1,32})(?:@\S+)?(?:[\s,:;]+([\s\S]*))?$/i);
     const candidate = m && getAgent(senderId, m[1]);
     // A mistyped agent name must not silently fall through to the chat provider —
     // you'd get a confident answer from something you didn't address.
