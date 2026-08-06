@@ -355,15 +355,28 @@ test('digest carries other agents\' turns but not the current one', () => {
 test('a mistyped agent name suggests the right one', () => {
   // Regression: a one-character typo fell through to the chat provider, which
   // answered confidently as something the user had not addressed.
-  const editDistance = build(grab('editDistance'), 'editDistance');
-  const agents = ['justin_quidli', 'justinahn', 'claude', 'hermes'];
-  const suggest = (typed) => agents
-    .map((n) => ({ n, d: editDistance(typed, n) }))
-    .filter((x) => x.d <= Math.max(2, Math.floor(x.n.length / 4)))
-    .sort((a, b) => a.d - b.d)[0]?.n ?? null;
+  const db = new DatabaseSync(':memory:');
+  db.exec(SCHEMA.agents);
+  for (const n of ['justin_quidli', 'justinahn', 'bob', 'alice']) {
+    db.exec(`INSERT INTO user_agents (user_id, agent_name, kind, provider)
+      VALUES ('u1','${n}','llm','anthropic')`);
+  }
+  const env = build(
+    [grabConst('const STOCK_AGENTS = \\{'), grab('normalizeAgentName'), grab('getAgent'),
+     grab('listAgents'), grab('editDistance'), grab('suggestAgentName')].join('\n'),
+    '{ suggestAgentName }', { db });
+  const suggest = (t) => env.suggestAgentName('u1', t);
 
   assert.equal(suggest('justin_quidl'), 'justin_quidli');
   assert.equal(suggest('justinah'), 'justinahn');
-  assert.equal(suggest('cluade'), 'claude');
-  assert.equal(suggest('weather'), null, 'unrelated commands still fall through');
+  assert.equal(suggest('cluade'), 'claude', 'transposition in a stock name');
+  assert.equal(suggest('bobb'), 'bob');
+  // "/justin.ahn" — punctuation stripped, then matched. Names can't hold a dot.
+  assert.equal(suggest('justinahn'), 'justinahn');
+
+  // Other bots' commands must not draw a reply. Distance alone was too loose:
+  // "ban" is within 2 of "bob", "remind" within 2 of "gemini".
+  for (const cmd of ['ban', 'remind', 'poll', 'start', 'settings', 'vote', 'weather', 'help']) {
+    assert.equal(suggest(cmd), null, `/${cmd} must stay silent`);
+  }
 });

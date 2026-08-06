@@ -670,6 +670,22 @@ function endpointKeyProvider(agentName) {
   return `endpoint:${agentName}`;
 }
 
+// Closest agent name to what was typed, or null. Distance alone is too loose —
+// "/ban" is within 2 of "bob" and "/remind" within 2 of "gemini" — so a shared
+// opening also has to match. That keeps other bots' commands from drawing a
+// reply while still catching real typos like "/cluade" or "/justin.ahn".
+function suggestAgentName(userId, attempted) {
+  const typed = String(attempted ?? '').toLowerCase();
+  if (!typed) return null;
+  return listAgents(userId)
+    .map((a) => ({ name: a.agent_name, d: editDistance(typed, a.agent_name) }))
+    .filter((x) => {
+      const prefix = Math.min(2, x.name.length);
+      return x.d <= 2 && typed.slice(0, prefix) === x.name.slice(0, prefix);
+    })
+    .sort((a, b) => a.d - b.d)[0]?.name ?? null;
+}
+
 // Levenshtein — used only to catch a mistyped agent name before it falls
 // through to the chat provider and gets answered by the wrong thing.
 function editDistance(a, b) {
@@ -2453,6 +2469,16 @@ tg.on(messageFilter('text'), async (ctx) => {
   recordChatMember(chatId, senderId, username);
 
   if (!isPrivate && !isMentioned && !isReplyToBot && !addressesOwnAgent) {
+    // An unrecognised /command in a group is usually another bot's, so silence is
+    // right. But if it's close to one of THIS sender's own agents it's a typo —
+    // and staying silent there just looks like the bot is broken. Note names can
+    // only be [a-z0-9_], so "/justin.ahn" never resolves however it's punctuated.
+    const attempted = text.match(/^\/([^\s@]{1,40})/)?.[1]?.toLowerCase().replace(/[^a-z0-9_]/g, '');
+    const near = attempted && suggestAgentName(senderId, attempted);
+    if (near) {
+      await ctx.reply(`No agent called /${attempted}. Did you mean /${near}?`).catch(() => {});
+      return;
+    }
     // Still check watchers even if not mentioned
     await checkWatchers(chatId, senderId, username, text).catch((err) => console.error('[watcher] error:', err.message));
     return;
@@ -2503,13 +2529,9 @@ tg.on(messageFilter('text'), async (ctx) => {
     // A mistyped agent name must not silently fall through to the chat provider —
     // you'd get a confident answer from something you didn't address.
     if (m && !candidate) {
-      const typed = m[1].toLowerCase();
-      const near = listAgents(senderId)
-        .map((a) => ({ name: a.agent_name, d: editDistance(typed, a.agent_name) }))
-        .filter((x) => x.d <= Math.max(2, Math.floor(x.name.length / 4)))
-        .sort((a, b) => a.d - b.d)[0];
+      const near = suggestAgentName(senderId, m[1]);
       if (near) {
-        await ctx.reply(`No agent called /${m[1]}. Did you mean /${near.name}?`).catch(() => {});
+        await ctx.reply(`No agent called /${m[1]}. Did you mean /${near}?`).catch(() => {});
         return;
       }
     }
