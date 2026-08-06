@@ -293,6 +293,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS chat_settings (
 )`);
 // Chat-level model override (e.g. "switch to fable" / "switch to kimi") — for upgrades
 try { db.exec(`ALTER TABLE chat_settings ADD COLUMN model TEXT`); } catch { }
+// Which agent unprefixed messages go to, set by "switch to <agent name>".
+// NULL means the chat behaves exactly as it did before agents existed.
+try { db.exec(`ALTER TABLE chat_settings ADD COLUMN agent_name TEXT`); } catch { }
 db.exec(`CREATE TABLE IF NOT EXISTS chat_members (
   chat_id    TEXT NOT NULL,
   user_id    TEXT NOT NULL,
@@ -471,6 +474,16 @@ const RESERVED_AGENT_NAMES = new Set([
   'connect', 'revoke', 'start', 'help',
 ]);
 
+// The host key for a provider, or null if the host hasn't configured one.
+// OpenRouter is deliberately absent — it's bring-your-own-key by design.
+function hostKeyFor(provider) {
+  return provider === 'anthropic' ? (ANTHROPIC_API_KEY || null)
+    : provider === 'gemini' ? (GEMINI_API_KEY || null)
+    : provider === 'openai' ? (OPENAI_API_KEY || null)
+    : provider === 'hermes' ? (NOUS_API_KEY || null)
+    : null;
+}
+
 function defaultModelForProvider(provider) {
   return provider === 'gemini' ? GEMINI_MODEL
     : provider === 'openai' ? OPENAI_MODEL
@@ -538,6 +551,8 @@ function clearAgentHistory(contextId, agentName) {
 function renameAgent(userId, from, to) {
   db.prepare('UPDATE user_agents SET agent_name = ? WHERE user_id = ? AND agent_name = ?')
     .run(to, String(userId), from);
+  // Follow the rename so a chat pointed at this agent doesn't strand itself.
+  db.prepare('UPDATE chat_settings SET agent_name = ? WHERE agent_name = ?').run(to, from);
   // An endpoint agent's bearer token is filed under its name — move it too, or
   // the renamed agent silently loses auth.
   db.prepare('UPDATE user_llm_keys SET provider = ? WHERE user_id = ? AND provider = ?')
@@ -676,12 +691,37 @@ try {
   console.error('[migrate] Minds → agents failed (non-fatal):', err.message);
 }
 
-// Switching providers always resets the model (null unless a specific model was named)
+// Switching providers always resets the model (null unless a specific model was
+// named) and clears any agent default — "switch to claude" means claude, not
+// "claude, but still routed through tim".
 function setChannelProvider(contextId, provider, model = null) {
-  db.prepare(`INSERT INTO chat_settings (context_id, provider, model, updated_at)
-    VALUES (?, ?, ?, unixepoch())
-    ON CONFLICT(context_id) DO UPDATE SET provider = excluded.provider, model = excluded.model, updated_at = unixepoch()`)
+  db.prepare(`INSERT INTO chat_settings (context_id, provider, model, agent_name, updated_at)
+    VALUES (?, ?, ?, NULL, unixepoch())
+    ON CONFLICT(context_id) DO UPDATE SET provider = excluded.provider, model = excluded.model,
+      agent_name = NULL, updated_at = unixepoch()`)
     .run(String(contextId), provider, model);
+}
+
+// "switch to tim" — unprefixed messages go to that agent until you switch away.
+function setChannelAgent(contextId, agentName) {
+  db.prepare(`INSERT INTO chat_settings (context_id, provider, agent_name, updated_at)
+    VALUES (?, COALESCE((SELECT provider FROM chat_settings WHERE context_id = ?), 'anthropic'), ?, unixepoch())
+    ON CONFLICT(context_id) DO UPDATE SET agent_name = excluded.agent_name, updated_at = unixepoch()`)
+    .run(String(contextId), String(contextId), agentName);
+}
+
+function getChannelAgentName(contextId) {
+  return db.prepare('SELECT agent_name FROM chat_settings WHERE context_id = ?')
+    .get(String(contextId))?.agent_name ?? null;
+}
+
+// Only consulted when detectProviderSwitch found nothing, so every existing
+// phrase ("switch to claude", "switch to kimi") keeps its current meaning.
+function detectAgentSwitch(text, userId) {
+  const m = String(text).toLowerCase().match(/^(?:switch|change|use|swap)\s+(?:to\s+)?\/?([a-z0-9_]{1,32})$/);
+  if (!m) return null;
+  const agent = getAgent(userId, m[1]);
+  return agent ? agent.agent_name : null;
 }
 
 function detectProviderSwitch(text) {
@@ -2098,10 +2138,16 @@ tg.command('agents', async (ctx) => {
   const mine = agents.filter((a) => !a.is_stock);
   const stock = agents.filter((a) => a.is_stock);
 
-  const fmt = (a) => `/${a.agent_name} — ${describeAgent(a)}`;
+  const current = getChannelAgentName(ctx.chat.id);
+  const fmt = (a) => `/${a.agent_name} — ${describeAgent(a)}`
+    + (a.agent_name === current ? '  ← messages go here' : '');
+  const provider = getChannelProvider(String(ctx.chat.id));
   await ctx.reply(
     (mine.length ? `Your agents:\n${mine.map(fmt).join('\n')}\n\n` : 'You haven\'t created any agents yet.\n\n') +
-    `Always available:\n${stock.map(fmt).join('\n')}\n\n` +
+    `Also available:\n${stock.map(fmt).join('\n')}\n\n` +
+    (current
+      ? `Unprefixed messages go to /${current}. Say "switch to claude" to go back to a model.\n\n`
+      : `Unprefixed messages go to ${provider}. Say "switch to <name>" to send them to an agent instead.\n\n`) +
     'Talk to one by name, e.g. /' + (mine[0]?.agent_name ?? 'claude') + ' hello\n' +
     'Create: /agent new <name> · Connect your Minds: /minds <key>'
   );
@@ -2133,9 +2179,12 @@ tg.command('agent', async (ctx) => {
     if (name !== String(parts[1]).toLowerCase()) {
       await ctx.reply(`Names become commands, so I'll use /${name}.`);
     }
-    // Only offer providers this user can actually run right now.
+    // Only offer providers that will actually work: the user has their own key,
+    // or they're allowed the host's AND the host has one configured. Offering a
+    // provider whose key is blank produces an agent that fails on first use.
+    const canHost = mayUseHostKey(ctx.from.id, ctx.from.username);
     const options = ['anthropic', 'gemini', 'openai', 'hermes', 'openrouter'].filter((p) =>
-      getUserLlmKeyFor(ctx.from.id, p) || mayUseHostKey(ctx.from.id, ctx.from.username));
+      getUserLlmKeyFor(ctx.from.id, p) || (canHost && hostKeyFor(p)));
     if (options.length === 0) {
       return ctx.reply(
         'You don\'t have any usable providers yet. Connect one first:\n' +
@@ -2416,6 +2465,16 @@ tg.on(messageFilter('text'), async (ctx) => {
       const quoted = msg.reply_to_message?.text;
       if (quoted) agentText = `[quoting an earlier message]\n${quoted}\n\n${agentText}`;
     }
+    // No explicit /name: fall back to the chat's default agent if one is set.
+    // Resolved fresh each turn so a deleted or renamed agent can't strand the chat.
+    if (!agent) {
+      const fallback = getChannelAgentName(contextId);
+      if (fallback) {
+        const resolved = getAgent(senderId, fallback);
+        if (resolved) agent = resolved;
+        else setChannelAgent(contextId, null); // it was deleted — quietly revert
+      }
+    }
   }
 
   // ── Host-key protection ──────────────────────────────────────────────────────
@@ -2458,6 +2517,22 @@ tg.on(messageFilter('text'), async (ctx) => {
       '3️⃣ Ask the bot owner to authorize you to use the host key.'
     ).catch(() => {});
     return;
+  }
+
+  // ── Agent switch ─────────────────────────────────────────────────────────────
+  // Checked only after provider detection finds nothing, so "switch to hermes"
+  // still means the provider and "switch to tim" means the agent.
+  if (!agent && isPrivate && !detectProviderSwitch(cleanText)) {
+    const target = detectAgentSwitch(cleanText, senderId);
+    if (target) {
+      setChannelAgent(contextId, target);
+      const a = getAgent(senderId, target);
+      await ctx.reply(
+        `🔀 Messages here now go to /${target} — ${describeAgent(a)}.\n` +
+        'Say "switch to claude" (or any provider) to go back.'
+      ).catch(() => {});
+      return;
+    }
   }
 
   // ── Provider switch detection ────────────────────────────────────────────────
@@ -2566,9 +2641,37 @@ tg.on(messageFilter('text'), async (ctx) => {
           .catch((err) => console.error('[minds-bg] unhandled:', err.message));
         return;
       }
-      const key = agent.base_url
-        ? (getUserLlmKeyFor(senderId, endpointKeyProvider(agent.agent_name))?.apiKey ?? null)
-        : (getUserLlmKeyFor(senderId, agent.provider)?.apiKey ?? null);
+      // Same key precedence as the non-agent path: the user's own key, else the
+      // host's if they're authorised. Only hermes needs this spelled out —
+      // the anthropic/gemini/openai clients fall back to their own host key
+      // internally, but getOpenAIClient would fall back to OPENAI_API_KEY, which
+      // is the wrong credential for a custom baseURL.
+      const ownKey = agent.base_url
+        ? getUserLlmKeyFor(senderId, endpointKeyProvider(agent.agent_name))?.apiKey
+        : getUserLlmKeyFor(senderId, agent.provider)?.apiKey;
+      let key = ownKey ?? null;
+      if (!key && agent.provider === 'hermes' && mayUseHostKey(senderId, username)) key = NOUS_API_KEY ?? null;
+
+      if (!key && agent.provider === 'openrouter') {
+        await editor.finalize(
+          `🔐 /${agent.agent_name} runs on OpenRouter, which is bring-your-own-key.\n\n` +
+          'DM me /llm openrouter <key> to connect one (openrouter.ai/keys).'
+        );
+        return;
+      }
+      if (!key && agent.base_url) {
+        await editor.finalize(
+          `⚠️ /${agent.agent_name} has no stored key. Re-add it with /agent endpoint ${agent.agent_name} <url> <key>.`
+        );
+        return;
+      }
+      if (!key && agent.provider === 'hermes') {
+        await editor.finalize(
+          `🔐 /${agent.agent_name} runs on Nous Portal and there's no key available to you.\n\n` +
+          'DM me /llm hermes <key> to connect your own (portal.nousresearch.com), or ask the bot owner to authorize you.'
+        );
+        return;
+      }
       let extraHeaders;
       try { extraHeaders = agent.headers ? JSON.parse(agent.headers) : undefined; } catch { extraHeaders = undefined; }
 
