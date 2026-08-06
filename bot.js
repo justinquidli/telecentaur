@@ -351,30 +351,9 @@ function deleteUserApiKey(telegramId) {
   db.prepare('UPDATE user_keys SET api_key = \'\' WHERE telegram_id = ?').run(String(telegramId));
 }
 
-function getUserMindsCredentials(telegramId) {
-  const row = db.prepare('SELECT minds_alias, minds_api_key, minds_name, minds_mind_id, minds_alias_created_at FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
-  if (!row?.minds_alias || !row?.minds_api_key) return null;
-  return {
-    alias: row.minds_alias,
-    apiKey: decrypt(row.minds_api_key),
-    name: row.minds_name ?? 'Minds',
-    mindId: row.minds_mind_id ?? null,
-    aliasCreatedAt: row.minds_alias_created_at ?? null,
-  };
-}
-
-function setUserMindsCredentials(telegramId, apiKey, alias, mindName, mindId) {
-  db.prepare(`INSERT INTO user_keys (telegram_id, minds_alias, minds_api_key, minds_name, minds_mind_id, minds_alias_created_at)
-    VALUES (?, ?, ?, ?, ?, unixepoch())
-    ON CONFLICT(telegram_id) DO UPDATE SET
-      minds_alias = excluded.minds_alias,
-      minds_api_key = excluded.minds_api_key,
-      minds_name = excluded.minds_name,
-      minds_mind_id = excluded.minds_mind_id,
-      minds_alias_created_at = excluded.minds_alias_created_at`)
-    .run(String(telegramId), alias, encrypt(apiKey), mindName ?? null, mindId ?? null);
-}
-
+// Note: the legacy single-Mind accessors were removed when Minds moved to the
+// agent registry. The columns stay so the one-time migration keeps working for
+// databases that haven't run it yet; deleteUserMindsCredentials still clears them.
 function deleteUserMindsCredentials(telegramId) {
   db.prepare('UPDATE user_keys SET minds_alias = NULL, minds_api_key = NULL, minds_name = NULL, minds_mind_id = NULL, minds_alias_created_at = NULL WHERE telegram_id = ?').run(String(telegramId));
 }
@@ -385,19 +364,11 @@ function getUserLlmKeyFor(telegramId, provider) {
   return { provider, apiKey: decrypt(row.api_key), model: row.model ?? null };
 }
 
-function hasAnyUserLlmKey(telegramId) {
-  return !!db.prepare('SELECT 1 FROM user_llm_keys WHERE user_id = ? LIMIT 1').get(String(telegramId));
-}
-
 function setUserLlmKey(telegramId, provider, apiKey, model) {
   db.prepare(`INSERT INTO user_llm_keys (user_id, provider, api_key, model)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(user_id, provider) DO UPDATE SET api_key = excluded.api_key, model = COALESCE(excluded.model, user_llm_keys.model)`)
     .run(String(telegramId), provider, encrypt(apiKey), model ?? null);
-}
-
-function setUserLlmModel(telegramId, provider, model) {
-  db.prepare('UPDATE user_llm_keys SET model = ? WHERE user_id = ? AND provider = ?').run(model, String(telegramId), provider);
 }
 
 function deleteUserLlmKey(telegramId, provider) {
