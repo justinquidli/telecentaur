@@ -302,6 +302,44 @@ db.exec(`CREATE TABLE IF NOT EXISTS chat_members (
   PRIMARY KEY (chat_id, user_id)
 )`);
 
+// ── Named agents ──────────────────────────────────────────────────────────────
+// A user-owned, user-named configuration you address as a slash command. `kind`
+// decides how it runs: 'llm' uses provider+model through the normal loops,
+// 'minds' routes to a Mind via its own alias. Stock providers are backfilled as
+// agents so `/claude` and `/hermes` exist without anyone creating them, and so
+// there is exactly one concept to learn.
+db.exec(`CREATE TABLE IF NOT EXISTS user_agents (
+  user_id     TEXT NOT NULL,
+  agent_name  TEXT NOT NULL,
+  kind        TEXT NOT NULL DEFAULT 'llm',
+  provider    TEXT,
+  model       TEXT,
+  base_url    TEXT,
+  headers     TEXT,
+  mind_id     TEXT,
+  alias       TEXT,
+  alias_at    INTEGER,
+  description TEXT,
+  is_stock    INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER DEFAULT (unixepoch()),
+  PRIMARY KEY (user_id, agent_name)
+)`);
+
+// Deliberately no "default agent" table. Agents are only ever reached by an
+// explicit /name in a DM; everything else keeps today's behaviour, including
+// `switch to X` setting the chat provider. One job per verb, no overlap.
+
+// One-time migration of the single stored Mind into an agent, so anyone already
+// connected keeps that conversation instead of silently starting over. Crude
+// slugging is fine here — re-running /minds registers everything properly.
+db.exec(`INSERT OR IGNORE INTO user_agents
+    (user_id, agent_name, kind, mind_id, alias, alias_at, description)
+  SELECT telegram_id,
+         substr(replace(replace(lower(minds_name), ' ', '_'), '-', '_'), 1, 32),
+         'minds', minds_mind_id, minds_alias, minds_alias_created_at, minds_name
+  FROM user_keys
+  WHERE minds_mind_id IS NOT NULL AND minds_alias IS NOT NULL AND minds_name IS NOT NULL`);
+
 function getUserApiKey(telegramId) {
   const row = db.prepare('SELECT api_key FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
   if (!row?.api_key) return null;
@@ -409,6 +447,185 @@ function getChannelProvider(contextId) {
 function getChannelModel(contextId) {
   const row = db.prepare('SELECT model FROM chat_settings WHERE context_id = ?').get(String(contextId));
   return row?.model ?? null;
+}
+
+// ── Agent registry ────────────────────────────────────────────────────────────
+
+// Stock agents exist for everyone without being stored. They're synthesized on
+// lookup, so there's no backfill and no rows for users who never use agents.
+// A user can customise one (e.g. set a model) — that writes a real row which
+// shadows the stock entry from then on.
+const STOCK_AGENTS = {
+  claude:     { kind: 'llm', provider: 'anthropic' },
+  gemini:     { kind: 'llm', provider: 'gemini' },
+  openai:     { kind: 'llm', provider: 'openai' },
+  hermes:     { kind: 'llm', provider: 'hermes' },
+  openrouter: { kind: 'llm', provider: 'openrouter' },
+};
+
+// Names double as Telegram commands, so they must be lowercase a-z0-9_ and <=32.
+function normalizeAgentName(raw) {
+  const slug = String(raw ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 32);
+  return slug || null;
+}
+
+// Commands the bot already owns — an agent named `minds` would shadow /minds.
+const RESERVED_AGENT_NAMES = new Set([
+  'agent', 'agents', 'minds', 'minds_remove', 'llm', 'llm_remove',
+  'connect', 'revoke', 'start', 'help',
+]);
+
+function defaultModelForProvider(provider) {
+  return provider === 'gemini' ? GEMINI_MODEL
+    : provider === 'openai' ? OPENAI_MODEL
+    : provider === 'hermes' ? NOUS_MODEL
+    : provider === 'anthropic' ? CLAUDE_MODEL
+    : null; // openrouter resolves from the user's stored key
+}
+
+function getAgent(userId, name) {
+  const agentName = normalizeAgentName(name);
+  if (!agentName) return null;
+  const row = db.prepare('SELECT * FROM user_agents WHERE user_id = ? AND agent_name = ?')
+    .get(String(userId), agentName);
+  if (row) return row;
+  const stock = STOCK_AGENTS[agentName];
+  if (!stock) return null;
+  return { user_id: String(userId), agent_name: agentName, ...stock, model: null, is_stock: 1 };
+}
+
+// `switch to minds` needs a single Mind to route to. Oldest registered wins, so
+// the one migrated from the pre-agent setup stays the one that mode uses.
+function firstMindsAgent(userId) {
+  return db.prepare(`SELECT * FROM user_agents WHERE user_id = ? AND kind = 'minds'
+    ORDER BY created_at, agent_name LIMIT 1`).get(String(userId)) ?? null;
+}
+
+function listAgents(userId) {
+  const rows = db.prepare('SELECT * FROM user_agents WHERE user_id = ? ORDER BY agent_name').all(String(userId));
+  const owned = new Set(rows.map((r) => r.agent_name));
+  const stock = Object.entries(STOCK_AGENTS)
+    .filter(([n]) => !owned.has(n))
+    .map(([n, s]) => ({ user_id: String(userId), agent_name: n, ...s, model: null, is_stock: 1 }));
+  return [...rows, ...stock];
+}
+
+function upsertAgent(userId, agentName, fields) {
+  const cols = ['kind', 'provider', 'model', 'base_url', 'headers', 'mind_id', 'alias', 'alias_at', 'description'];
+  const existing = db.prepare('SELECT * FROM user_agents WHERE user_id = ? AND agent_name = ?')
+    .get(String(userId), agentName);
+  const merged = {};
+  for (const c of cols) merged[c] = fields[c] !== undefined ? fields[c] : (existing?.[c] ?? null);
+  db.prepare(`INSERT INTO user_agents (user_id, agent_name, kind, provider, model, base_url, headers, mind_id, alias, alias_at, description)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, agent_name) DO UPDATE SET
+      kind = excluded.kind, provider = excluded.provider, model = excluded.model,
+      base_url = excluded.base_url, headers = excluded.headers, mind_id = excluded.mind_id,
+      alias = excluded.alias, alias_at = excluded.alias_at, description = excluded.description`)
+    .run(String(userId), agentName, merged.kind ?? 'llm', merged.provider, merged.model,
+         merged.base_url, merged.headers, merged.mind_id, merged.alias, merged.alias_at, merged.description);
+}
+
+// Each agent keeps its own thread via a composite history key, so switching
+// between them no longer clobbers anything.
+function agentContextId(contextId, agentName) {
+  return agentName ? `${contextId}::${agentName}` : String(contextId);
+}
+
+function clearAgentHistory(contextId, agentName) {
+  const key = agentContextId(contextId, agentName);
+  anthropicHistories.delete(key);
+  geminiHistories.delete(key);
+  openaiHistories.delete(key);
+}
+
+function renameAgent(userId, from, to) {
+  db.prepare('UPDATE user_agents SET agent_name = ? WHERE user_id = ? AND agent_name = ?')
+    .run(to, String(userId), from);
+  // An endpoint agent's bearer token is filed under its name — move it too, or
+  // the renamed agent silently loses auth.
+  db.prepare('UPDATE user_llm_keys SET provider = ? WHERE user_id = ? AND provider = ?')
+    .run(`endpoint:${to}`, String(userId), `endpoint:${from}`);
+}
+
+function deleteAgent(userId, agentName) {
+  db.prepare('DELETE FROM user_agents WHERE user_id = ? AND agent_name = ?').run(String(userId), agentName);
+  db.prepare('DELETE FROM user_llm_keys WHERE user_id = ? AND provider = ?')
+    .run(String(userId), `endpoint:${agentName}`);
+}
+
+// Human-readable backing, used in /agents and the reply label.
+function describeAgent(agent) {
+  if (!agent) return '';
+  if (agent.kind === 'minds') return `Minds · ${agent.description || agent.agent_name}`;
+  if (agent.base_url) return `agent endpoint${agent.model && agent.model !== 'hermes-agent' ? ` · ${agent.model}` : ''}`;
+  const model = agent.model || defaultModelForProvider(agent.provider) || 'your key\'s default';
+  return `${agent.provider} · ${model}`;
+}
+
+// The Minds builder key is one-per-user and covers every Mind on the account,
+// so it stays where it already lives rather than being copied onto each agent.
+function getMindsBuilderKey(telegramId) {
+  const row = db.prepare('SELECT minds_api_key FROM user_keys WHERE telegram_id = ?').get(String(telegramId));
+  return row?.minds_api_key ? decrypt(row.minds_api_key) : null;
+}
+
+function mintMindsAlias(telegramId) {
+  return `tc${String(telegramId).slice(-8)}${randomBytes(2).toString('hex')}`;
+}
+
+function setUserMindsBuilderKey(telegramId, apiKey) {
+  db.prepare(`INSERT INTO user_keys (telegram_id, minds_api_key) VALUES (?, ?)
+    ON CONFLICT(telegram_id) DO UPDATE SET minds_api_key = excluded.minds_api_key`)
+    .run(String(telegramId), encrypt(apiKey));
+}
+
+// Telegram replaces (never merges) the command list for a scope, so the base
+// list lives here in code. Publishing base + agents means a user's existing
+// commands can't be lost by adding an agent.
+const BASE_COMMANDS = [
+  { command: 'agents', description: 'List your agents' },
+  { command: 'agent', description: 'Create or manage an agent' },
+  { command: 'connect', description: 'Link your Quidli API key' },
+  { command: 'revoke', description: 'Remove your Quidli API key' },
+  { command: 'llm', description: 'Use your own LLM key' },
+  { command: 'llm_remove', description: 'Remove your LLM key' },
+  { command: 'minds', description: 'Connect your Minds agents' },
+  { command: 'minds_remove', description: 'Remove your Minds credentials' },
+];
+
+// Best-effort: agents still work by typing even if this fails.
+async function refreshAgentCommands(ctx) {
+  try {
+    const agents = listAgents(ctx.from.id)
+      .filter((a) => !a.is_stock)
+      .map((a) => ({
+        command: a.agent_name,
+        description: (describeAgent(a) || 'agent').slice(0, 256),
+      }));
+    await ctx.telegram.setMyCommands([...BASE_COMMANDS, ...agents], {
+      scope: { type: 'chat', chat_id: ctx.chat.id },
+    });
+  } catch (err) {
+    console.error('[agents] setMyCommands failed:', err.message);
+  }
+}
+
+// A stable per-agent conversation handle for OpenAI-compatible agent endpoints
+// (sent as X-Hermes-Session-Key). Generated once and stored, so renaming an
+// agent doesn't silently reset its memory.
+function mintSessionKey(telegramId) {
+  return `telecentaur:${telegramId}:${randomBytes(4).toString('hex')}`;
+}
+
+// Endpoint agents keep their bearer token in the encrypted key store, filed
+// under a synthetic provider so it never sits plaintext on the agent row.
+function endpointKeyProvider(agentName) {
+  return `endpoint:${agentName}`;
 }
 
 // Switching providers always resets the model (null unless a specific model was named)
@@ -1271,11 +1488,15 @@ async function getGeminiClient(userApiKey) {
   return new GoogleGenAI({ apiKey: key });
 }
 
-async function getOpenAIClient(userApiKey, baseURL) {
+async function getOpenAIClient(userApiKey, baseURL, headers) {
   const key = userApiKey || OPENAI_API_KEY;
   if (!key) throw new Error('No OpenAI API key available. DM me /llm openai <key> to connect your own.');
   const { default: OpenAI } = await import('openai');
-  return new OpenAI({ apiKey: key, ...(baseURL ? { baseURL } : {}) });
+  return new OpenAI({
+    apiKey: key,
+    ...(baseURL ? { baseURL } : {}),
+    ...(headers ? { defaultHeaders: headers } : {}),
+  });
 }
 
 function getGeminiTools() {
@@ -1460,8 +1681,8 @@ async function runGeminiLoop(contextId, contextualText, editor, toolCtx, userLlm
   return accumulated;
 }
 
-async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlmKey, { baseURL, model } = {}) {
-  const openai = await getOpenAIClient(userLlmKey, baseURL);
+async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlmKey, { baseURL, model, headers } = {}) {
+  const openai = await getOpenAIClient(userLlmKey, baseURL, headers);
   const modelToUse = model || OPENAI_MODEL;
   console.log(`[api-call] openai-compatible model="${modelToUse}" baseURL="${baseURL || 'api.openai.com (default)'}" usingUserKey=${!!userLlmKey}`);
   const history = getOpenAIHistory(contextId);
@@ -1528,34 +1749,40 @@ async function runOpenAILoop(contextId, contextualText, editor, toolCtx, userLlm
 
 const MINDS_ALIAS_MAX_AGE_S = 4 * 60 * 60; // rotate conversation thread every 4 hours
 
-async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderId, mindName) {
-  let creds = getUserMindsCredentials(senderId);
-  if (!creds) {
+// Takes the agent to run rather than resolving a single stored Mind, so several
+// Minds can be addressed independently. Each agent owns its own alias, which is
+// what keeps their conversations separate.
+async function runMindsBackground(contextId, text, chatId, pendingMsgId, senderId, agent) {
+  const apiKey = getMindsBuilderKey(senderId);
+  if (!apiKey || !agent?.mind_id) {
     await tg.telegram.editMessageText(chatId, pendingMsgId, null,
       '⚠️ You need to connect your Minds agent.\nDM me /minds <builder-api-key> to connect.\nGet a Builder API key at https://build.hellominds.ai/console'
     ).catch(() => {});
     return;
   }
 
-  // Rotate alias if older than 4 hours to prevent Minds falling back to email
-  if (creds.mindId && creds.aliasCreatedAt) {
-    const ageS = Math.floor(Date.now() / 1000) - creds.aliasCreatedAt;
+  const mindName = agent.description || agent.agent_name;
+  let alias = agent.alias;
+
+  // Rotate alias if older than 4 hours to prevent Minds falling back to email.
+  // Rotation starts a fresh thread on the Minds side — a constraint of theirs,
+  // not a choice of ours.
+  if (agent.alias_at) {
+    const ageS = Math.floor(Date.now() / 1000) - agent.alias_at;
     if (ageS > MINDS_ALIAS_MAX_AGE_S) {
       try {
-        const rotateClient = createMindsClient({ builderApiKey: creds.apiKey });
-        const newAlias = `tc${String(senderId).slice(-8)}${randomBytes(2).toString('hex')}`;
-        await rotateClient.ensureConversation(newAlias, creds.mindId);
-        setUserMindsCredentials(senderId, creds.apiKey, newAlias, creds.name, creds.mindId);
-        creds = getUserMindsCredentials(senderId);
-        console.log(`[minds] Rotated alias for ${senderId} → ${newAlias}`);
+        const rotateClient = createMindsClient({ builderApiKey: apiKey });
+        const newAlias = mintMindsAlias(senderId);
+        await rotateClient.ensureConversation(newAlias, agent.mind_id);
+        upsertAgent(senderId, agent.agent_name, { alias: newAlias, alias_at: Math.floor(Date.now() / 1000) });
+        alias = newAlias;
+        console.log(`[minds] Rotated alias for ${senderId}/${agent.agent_name} → ${newAlias}`);
       } catch (err) {
         console.error('[minds-rotate] failed:', err.message);
         // Continue with old alias rather than failing
       }
     }
   }
-
-  const { alias, apiKey } = creds;
   const userText = text.replace(/^\[Current date.*?\]\n\[Sent by.*?\]\s*/s, '').trim();
   const mindsClient = createMindsClient({ builderApiKey: apiKey });
 
@@ -1643,6 +1870,21 @@ const tg = new Telegraf(TELEGRAM_TOKEN, { handlerTimeout: Infinity });
 
 // ── DM / private chat commands ────────────────────────────────────────────────
 
+// A message containing an API key otherwise sits in Telegram history forever.
+// Bots may delete incoming messages in private chats, so remove it once parsed.
+async function scrubCredentialMessage(ctx) {
+  try {
+    await ctx.deleteMessage();
+    return true;
+  } catch {
+    return false; // >48h old, or permissions changed — fall back to telling the user
+  }
+}
+
+const scrubNote = (scrubbed) => scrubbed
+  ? '\n\n🧹 I deleted your message so the key isn\'t left in this chat.'
+  : '\n\n⚠️ Couldn\'t delete your message — delete it yourself so the key isn\'t left in this chat.';
+
 tg.command('connect', async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   const apiKey = ctx.message.text.replace('/connect', '').trim();
@@ -1650,10 +1892,11 @@ tg.command('connect', async (ctx) => {
     return ctx.reply('Usage: /connect <your-api-key>\nGet a key at https://connect.quid.li');
   }
   setUserApiKey(ctx.from.id, apiKey);
+  const scrubbed = await scrubCredentialMessage(ctx);
   ctx.reply(
     '✅ Connected! Drops will now use your Smart Send wallet.\n\n' +
     '⚠️ Your API key is stored encrypted and only has access to your Smart Send balance — not your main wallet. ' +
-    'DM /revoke anytime to disconnect.'
+    'DM /revoke anytime to disconnect.' + scrubNote(scrubbed)
   );
 });
 
@@ -1669,46 +1912,80 @@ tg.command('revoke', async (ctx) => {
 
 tg.command('minds', async (ctx) => {
   if (ctx.chat.type !== 'private') return;
-  const parts = ctx.message.text.replace('/minds', '').trim().split(/\s+/);
-  const apiKey = parts[0];
-  const mindName = parts[1] || null;
+  const apiKey = ctx.message.text.replace('/minds', '').trim().split(/\s+/)[0];
 
   if (!apiKey) {
     return ctx.reply(
-      'Usage:\n/minds <builder-api-key> — connect your first enabled Mind\n/minds <builder-api-key> <mind-name> — connect a specific Mind\n\nGet a Builder API key at https://build.hellominds.ai/console'
+      'Usage: /minds <builder-api-key>\n\n' +
+      'Every enabled Mind on your account becomes its own command, so you can talk to ' +
+      'them separately without switching.\n\n' +
+      'Get a Builder API key at https://build.hellominds.ai/console'
     );
   }
 
   try {
     const client = createMindsClient({ builderApiKey: apiKey });
     const minds = await client.listMinds();
-    const enabledMinds = minds.filter((m) => m.isEnabled);
+    const enabled = minds.filter((m) => m.isEnabled);
 
-    if (enabledMinds.length === 0) {
+    if (enabled.length === 0) {
       return ctx.reply('❌ No enabled Minds found on your account. Visit https://build.hellominds.ai to set one up.');
     }
 
-    let selectedMind;
-    if (mindName) {
-      selectedMind = enabledMinds.find((m) => m.name.toLowerCase() === mindName.toLowerCase());
-      if (!selectedMind) {
-        const names = enabledMinds.map((m) => m.name).join(', ');
-        return ctx.reply(`❌ Mind "${mindName}" not found or not enabled.\nYour enabled Minds: ${names}`);
+    // Keep the builder key where it already lives — one key covers every Mind.
+    setUserMindsBuilderKey(ctx.from.id, apiKey);
+
+    // Register each enabled Mind as its own agent with its own conversation alias.
+    const registered = [];
+    const skipped = [];
+    const taken = new Set(listAgents(ctx.from.id).map((a) => a.agent_name));
+
+    for (const mind of enabled) {
+      let name = normalizeAgentName(mind.name);
+      if (!name) name = `mind_${String(mind.mindId).slice(0, 6).toLowerCase()}`;
+      // Don't shadow a bot command or an agent that already points elsewhere.
+      if (RESERVED_AGENT_NAMES.has(name)) name = `${name}_mind`.slice(0, 32);
+      const existing = getAgent(ctx.from.id, name);
+      if (taken.has(name) && existing?.mind_id && existing.mind_id !== mind.mindId) {
+        let n = 2;
+        while (taken.has(`${name}_${n}`.slice(0, 32))) n++;
+        name = `${name}_${n}`.slice(0, 32);
       }
-    } else {
-      selectedMind = enabledMinds[0];
+
+      // Reuse an alias we already minted for this Mind so its thread survives.
+      const already = listAgents(ctx.from.id).find((a) => a.mind_id === mind.mindId);
+      const alias = already?.alias ?? mintMindsAlias(ctx.from.id);
+      try {
+        if (!already?.alias) await client.ensureConversation(alias, mind.mindId);
+      } catch (err) {
+        skipped.push(`${mind.name} — ${err.message.slice(0, 60)}`);
+        continue;
+      }
+
+      upsertAgent(ctx.from.id, name, {
+        kind: 'minds',
+        mind_id: mind.mindId,
+        alias,
+        alias_at: already?.alias_at ?? Math.floor(Date.now() / 1000),
+        description: mind.name,
+      });
+      taken.add(name);
+      registered.push({ name, label: mind.name });
     }
 
-    const userAlias = `tc${String(ctx.from.id).slice(-8)}${randomBytes(2).toString('hex')}`;
-    await client.ensureConversation(userAlias, selectedMind.mindId);
-    setUserMindsCredentials(ctx.from.id, apiKey, userAlias, selectedMind.name, selectedMind.mindId);
+    const disabled = minds.filter((m) => !m.isEnabled);
+    const scrubbed = await scrubCredentialMessage(ctx);
+    await refreshAgentCommands(ctx);
 
-    const otherMinds = enabledMinds.filter((m) => m.mindId !== selectedMind.mindId);
-    const switchHint = otherMinds.length > 0
-      ? `\n\nTo use a different Mind: /minds <key> <mind-name>\nYour other Minds: ${otherMinds.map((m) => m.name).join(', ')}`
-      : '';
-
-    ctx.reply(`✅ Connected to your ${selectedMind.name} Mind. When the chat is in Minds mode, your messages will go to this Mind.${switchHint}`);
+    const lines = registered.map((r) => `/${r.name} — ${r.label}`).join('\n');
+    await ctx.reply(
+      `✅ Registered ${registered.length} Mind${registered.length === 1 ? '' : 's'}:\n\n${lines}\n\n` +
+      (disabled.length ? `Skipped ${disabled.length} disabled: ${disabled.map((m) => m.name).join(', ')}\n` : '') +
+      (skipped.length ? `⚠️ Couldn't connect: ${skipped.join('; ')}\n` : '') +
+      `\nTalk to one by name, e.g. /${registered[0]?.name ?? 'yourmind'} what's on today\n` +
+      'Rename with /agent rename <old> <new> · see all with /agents' +
+      scrubNote(scrubbed)
+    );
   } catch (err) {
     ctx.reply(`❌ Failed to connect: ${err.message}`);
   }
@@ -1716,8 +1993,167 @@ tg.command('minds', async (ctx) => {
 
 tg.command('minds_remove', async (ctx) => {
   if (ctx.chat.type !== 'private') return;
+  const removed = db.prepare("DELETE FROM user_agents WHERE user_id = ? AND kind = 'minds'")
+    .run(String(ctx.from.id)).changes ?? 0;
   deleteUserMindsCredentials(ctx.from.id);
-  ctx.reply('🗑️ Your Minds credentials have been removed.');
+  await refreshAgentCommands(ctx);
+  ctx.reply(`🗑️ Your Minds credentials have been removed${removed ? `, along with ${removed} Mind agent${removed === 1 ? '' : 's'}` : ''}.`);
+});
+
+tg.command('agents', async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  const agents = listAgents(ctx.from.id);
+  const mine = agents.filter((a) => !a.is_stock);
+  const stock = agents.filter((a) => a.is_stock);
+
+  const fmt = (a) => `/${a.agent_name} — ${describeAgent(a)}`;
+  await ctx.reply(
+    (mine.length ? `Your agents:\n${mine.map(fmt).join('\n')}\n\n` : 'You haven\'t created any agents yet.\n\n') +
+    `Always available:\n${stock.map(fmt).join('\n')}\n\n` +
+    'Talk to one by name, e.g. /' + (mine[0]?.agent_name ?? 'claude') + ' hello\n' +
+    'Create: /agent new <name> · Connect your Minds: /minds <key>'
+  );
+});
+
+tg.command('agent', async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  const parts = ctx.message.text.replace(/^\/agent(@\S+)?/, '').trim().split(/\s+/).filter(Boolean);
+  const sub = (parts[0] ?? '').toLowerCase();
+  const usage =
+    'Manage your agents:\n\n' +
+    '/agent new <name> — create one, pick what it runs on\n' +
+    '/agent model <name> <model> — change its model\n' +
+    '/agent rename <old> <new>\n' +
+    '/agent delete <name>\n' +
+    '/agent endpoint <name> <url> <key> — point at your own agent server\n\n' +
+    'See them all with /agents';
+
+  if (!sub) return ctx.reply(usage);
+
+  // ── create ────────────────────────────────────────────────────────────────
+  if (sub === 'new') {
+    const name = normalizeAgentName(parts[1]);
+    if (!name) return ctx.reply('Give it a name: /agent new bob');
+    if (RESERVED_AGENT_NAMES.has(name)) return ctx.reply(`"${name}" is a bot command — pick another name.`);
+    if (getAgent(ctx.from.id, name)) {
+      return ctx.reply(`/${name} already exists. Change what it runs on with /agent model ${name} <model>, or /agent delete ${name} first.`);
+    }
+    if (name !== String(parts[1]).toLowerCase()) {
+      await ctx.reply(`Names become commands, so I'll use /${name}.`);
+    }
+    // Only offer providers this user can actually run right now.
+    const options = ['anthropic', 'gemini', 'openai', 'hermes', 'openrouter'].filter((p) =>
+      getUserLlmKeyFor(ctx.from.id, p) || mayUseHostKey(ctx.from.id, ctx.from.username));
+    if (options.length === 0) {
+      return ctx.reply(
+        'You don\'t have any usable providers yet. Connect one first:\n' +
+        '/llm hermes <key> — portal.nousresearch.com (has a free tier)\n' +
+        '/llm anthropic <key> — console.anthropic.com'
+      );
+    }
+    return ctx.reply(`What should /${name} run on?`, {
+      reply_markup: {
+        inline_keyboard: options.map((p) => [{ text: p, callback_data: `agentnew:${name}:${p}` }]),
+      },
+    });
+  }
+
+  // ── change model ──────────────────────────────────────────────────────────
+  if (sub === 'model') {
+    const name = normalizeAgentName(parts[1]);
+    const model = parts.slice(2).join(' ').trim();
+    const agent = name && getAgent(ctx.from.id, name);
+    if (!agent) return ctx.reply(`No agent called /${name ?? '?'}. See /agents`);
+    if (agent.kind === 'minds') return ctx.reply('Minds agents get their model from Minds — change it at build.hellominds.ai.');
+    if (!model) return ctx.reply(`Usage: /agent model ${name} <model>\nCurrently: ${describeAgent(agent)}`);
+    upsertAgent(ctx.from.id, name, { kind: agent.kind, provider: agent.provider, base_url: agent.base_url, model });
+    await refreshAgentCommands(ctx);
+    return ctx.reply(`✅ /${name} now runs ${model}.`);
+  }
+
+  // ── rename ────────────────────────────────────────────────────────────────
+  if (sub === 'rename') {
+    const from = normalizeAgentName(parts[1]);
+    const to = normalizeAgentName(parts[2]);
+    if (!from || !to) return ctx.reply('Usage: /agent rename <old> <new>');
+    const agent = from && getAgent(ctx.from.id, from);
+    if (!agent || agent.is_stock) return ctx.reply(`No agent of yours called /${from}. See /agents`);
+    if (RESERVED_AGENT_NAMES.has(to)) return ctx.reply(`"${to}" is a bot command — pick another name.`);
+    if (getAgent(ctx.from.id, to)) return ctx.reply(`/${to} is already taken.`);
+    renameAgent(ctx.from.id, from, to);
+    await refreshAgentCommands(ctx);
+    return ctx.reply(`✅ /${from} is now /${to}. Its conversation carried over.`);
+  }
+
+  // ── delete ────────────────────────────────────────────────────────────────
+  if (sub === 'delete') {
+    const name = normalizeAgentName(parts[1]);
+    const agent = name && getAgent(ctx.from.id, name);
+    if (!agent || agent.is_stock) return ctx.reply(`No agent of yours called /${name ?? '?'}. See /agents`);
+    deleteAgent(ctx.from.id, name);
+    clearAgentHistory(String(ctx.chat.id), name);
+    await refreshAgentCommands(ctx);
+    return ctx.reply(`🗑️ /${name} deleted.`);
+  }
+
+  // ── point at your own agent server ────────────────────────────────────────
+  if (sub === 'endpoint') {
+    const name = normalizeAgentName(parts[1]);
+    const url = parts[2];
+    const key = parts[3];
+    if (!name || !url || !key) {
+      return ctx.reply(
+        'Usage: /agent endpoint <name> <url> <key>\n\n' +
+        'Points an agent at any OpenAI-compatible agent server — e.g. a Hermes API server:\n' +
+        '/agent endpoint rig https://your-host:8642/v1 <API_SERVER_KEY>\n\n' +
+        'Your message is deleted straight after so the key isn\'t left in this chat.'
+      );
+    }
+    if (RESERVED_AGENT_NAMES.has(name)) return ctx.reply(`"${name}" is a bot command — pick another name.`);
+    const twin = listAgents(ctx.from.id).find((a) => a.base_url === url && a.agent_name !== name);
+    // The bearer token goes through the same encrypted store as every other key —
+    // never into user_agents, which is plaintext. Only the (non-secret) session
+    // key lives on the agent row.
+    setUserLlmKey(ctx.from.id, endpointKeyProvider(name), key, null);
+    upsertAgent(ctx.from.id, name, {
+      kind: 'llm', provider: 'endpoint', base_url: url, model: 'hermes-agent',
+      headers: JSON.stringify({ 'X-Hermes-Session-Key': getAgent(ctx.from.id, name)?.headers
+        ? JSON.parse(getAgent(ctx.from.id, name).headers)['X-Hermes-Session-Key']
+        : mintSessionKey(ctx.from.id) }),
+    });
+    const scrubbed = await scrubCredentialMessage(ctx);
+    await refreshAgentCommands(ctx);
+    return ctx.reply(
+      `✅ /${name} points at your agent server.` +
+      (twin ? `\n\n⚠️ Same URL as /${twin.agent_name} — that's the same agent with a separate memory, not a second one. Run another profile for a genuinely separate agent.` : '') +
+      scrubNote(scrubbed)
+    );
+  }
+
+  return ctx.reply(usage);
+});
+
+// Button press from `/agent new <name>` — picks what the agent runs on.
+tg.action(/^agentnew:([a-z0-9_]{1,32}):([a-z]+)$/, async (ctx) => {
+  const [, name, provider] = ctx.match;
+  try {
+    if (getAgent(ctx.from.id, name)?.is_stock === 0) {
+      await ctx.answerCbQuery('Already exists');
+      return;
+    }
+    upsertAgent(ctx.from.id, name, { kind: 'llm', provider, model: null });
+    await ctx.answerCbQuery('Created');
+    await refreshAgentCommands(ctx);
+    const agent = getAgent(ctx.from.id, name);
+    await ctx.editMessageText(
+      `✅ /${name} is ready — ${describeAgent(agent)}.\n\n` +
+      `Talk to it: /${name} hello\n` +
+      `Change its model: /agent model ${name} <model>`
+    );
+  } catch (err) {
+    console.error('[agentnew] failed:', err.message);
+    await ctx.answerCbQuery('Something went wrong').catch(() => {});
+  }
 });
 
 tg.command('llm', async (ctx) => {
@@ -1823,7 +2259,8 @@ tg.on(messageFilter('text'), async (ctx) => {
   }
 
   // Skip DM commands (handled by command handlers above)
-  if (isPrivate && (text.startsWith('/connect') || text.startsWith('/revoke') || text.startsWith('/minds') || text.startsWith('/llm'))) {
+  if (isPrivate && (text.startsWith('/connect') || text.startsWith('/revoke') || text.startsWith('/minds') || text.startsWith('/llm')
+      || text.startsWith('/agent') || text.startsWith('/agents'))) {
     return;
   }
 
@@ -1848,13 +2285,45 @@ tg.on(messageFilter('text'), async (ctx) => {
 
   const contextId = String(chatId);
 
+  // ── Agent addressing (DMs only) ──────────────────────────────────────────────
+  // A message starting with /name, where name is one of this user's agents,
+  // goes to that agent. Anything else — including /foo that isn't an agent —
+  // falls through to exactly the behaviour that existed before agents.
+  let agent = null;
+  let agentText = cleanText;
+  if (isPrivate) {
+    const m = cleanText.match(/^\/([a-z0-9_]{1,32})(?:@\S+)?(?:\s+([\s\S]*))?$/i);
+    const candidate = m && getAgent(senderId, m[1]);
+    if (candidate) {
+      agent = candidate;
+      agentText = (m[2] ?? '').trim();
+      if (!agentText) {
+        // Naming an agent with nothing to say shows its card instead of burning a turn.
+        await ctx.reply(
+          `/${agent.agent_name} — ${describeAgent(agent)}\n\n` +
+          `Talk to it: /${agent.agent_name} <message>` +
+          (agent.is_stock ? '' : `\nRename: /agent rename ${agent.agent_name} <new>`)
+        ).catch(() => {});
+        return;
+      }
+      // Replying to a message while addressing an agent hands it the quote, so
+      // you can pass one agent's answer to another without copy-pasting.
+      const quoted = msg.reply_to_message?.text;
+      if (quoted) agentText = `[quoting an earlier message]\n${quoted}\n\n${agentText}`;
+    }
+  }
+
   // ── Host-key protection ──────────────────────────────────────────────────────
   // The host's LLM keys are spendable only by the owner or explicitly authorized
   // handles. Everyone else must have their own key FOR THE PROVIDER IN USE — a
   // Gemini key must not unlock the host's Nous key. Checked before the switch is
   // applied, since switching changes the provider for everyone in the chat.
   // Providers outside HOST_KEY_PROVIDERS (openrouter, minds) are per-user already.
-  const activeProvider = detectProviderSwitch(cleanText) ?? getChannelProvider(contextId);
+  // An addressed agent decides the provider; otherwise this is unchanged.
+  // 'endpoint' agents carry their own key, so they never touch a host key.
+  const activeProvider = agent
+    ? (agent.kind === 'minds' ? 'minds' : agent.provider)
+    : (detectProviderSwitch(cleanText) ?? getChannelProvider(contextId));
   // An OpenRouter key also counts for 'anthropic' — the branch below deliberately
   // routes Claude through OpenRouter on the user's own credits in that case.
   const hasOwnKeyForProvider = !!getUserLlmKeyFor(senderId, activeProvider)
@@ -1887,7 +2356,9 @@ tg.on(messageFilter('text'), async (ctx) => {
   }
 
   // ── Provider switch detection ────────────────────────────────────────────────
-  const switchTarget = detectProviderSwitch(cleanText);
+  // Skipped when an agent is addressed — "/bob switch to gemini" is a message
+  // for bob, not an instruction to the bot.
+  const switchTarget = agent ? null : detectProviderSwitch(cleanText);
   if (switchTarget) {
     if (switchTarget === 'gemini' && !GEMINI_API_KEY) {
       await ctx.reply('⚠️ GEMINI_API_KEY is not set in .env.').catch(() => {});
@@ -1935,7 +2406,7 @@ tg.on(messageFilter('text'), async (ctx) => {
   const provider = getChannelProvider(contextId);
 
   // Send placeholder then edit it as response comes in
-  const pendingMsg = await ctx.reply('Thinking…').catch((err) => {
+  const pendingMsg = await ctx.reply(agent ? `${agent.agent_name} is thinking…` : 'Thinking…').catch((err) => {
     console.error('[tg] reply failed:', err.message);
     return null;
   });
@@ -1954,7 +2425,7 @@ tg.on(messageFilter('text'), async (ctx) => {
   const now = new Date();
   const timeContext = `[Current date and time: ${now.toUTCString()} | Local ISO: ${now.toISOString()}]`;
   const senderContext = `[Sent by @${username} (Telegram ID: ${senderId})]`;
-  const contextualText = `${timeContext}\n${senderContext} ${walletNote}\n${cleanText}`;
+  const contextualText = `${timeContext}\n${senderContext} ${walletNote}\n${agentText}`;
 
   const toolCtx = {
     senderId,
@@ -1976,7 +2447,36 @@ tg.on(messageFilter('text'), async (ctx) => {
     const anthKey = getUserLlmKeyFor(senderId, 'anthropic');
     const orKey = getUserLlmKeyFor(senderId, 'openrouter');
 
-    if (effectiveProvider === 'gemini') {
+    if (agent) {
+      // Agents run on their own history key, so each keeps its own thread.
+      const aCtx = agentContextId(contextId, agent.agent_name);
+      if (agent.kind === 'minds') {
+        runMindsBackground(aCtx, contextualText, chatId, pendingMsg.message_id, senderId, agent)
+          .catch((err) => console.error('[minds-bg] unhandled:', err.message));
+        return;
+      }
+      const key = agent.base_url
+        ? (getUserLlmKeyFor(senderId, endpointKeyProvider(agent.agent_name))?.apiKey ?? null)
+        : (getUserLlmKeyFor(senderId, agent.provider)?.apiKey ?? null);
+      let extraHeaders;
+      try { extraHeaders = agent.headers ? JSON.parse(agent.headers) : undefined; } catch { extraHeaders = undefined; }
+
+      if (agent.provider === 'gemini') {
+        accumulated = await runGeminiLoop(aCtx, contextualText, editor, toolCtx, key);
+      } else if (agent.provider === 'anthropic') {
+        accumulated = await runAnthropicLoop(aCtx, contextualText, editor, toolCtx, key, agent.model || undefined);
+      } else {
+        accumulated = await runOpenAILoop(aCtx, contextualText, editor, toolCtx, key, {
+          baseURL: agent.base_url
+            || (agent.provider === 'hermes' ? NOUS_API_BASE_URL
+              : agent.provider === 'openrouter' ? 'https://openrouter.ai/api/v1'
+              : undefined),
+          model: agent.model || defaultModelForProvider(agent.provider) || undefined,
+          headers: extraHeaders,
+        });
+      }
+      modelLabel = `${agent.agent_name} · ${describeAgent(agent)}`;
+    } else if (effectiveProvider === 'gemini') {
       accumulated = await runGeminiLoop(contextId, contextualText, editor, toolCtx, getUserLlmKeyFor(senderId, 'gemini')?.apiKey ?? null);
       modelLabel = GEMINI_MODEL;
     } else if (effectiveProvider === 'openai') {
@@ -2014,15 +2514,19 @@ tg.on(messageFilter('text'), async (ctx) => {
       });
       modelLabel = hermesModel;
     } else if (effectiveProvider === 'minds') {
-      const creds = getUserMindsCredentials(senderId);
-      const mindName = creds?.name ?? 'unknown';
+      // `switch to minds` stays exactly as it was for the user, but now resolves
+      // through the agent registry rather than a separate stored credential —
+      // one implementation, so Minds mode and /agentname can't drift apart.
+      const creds = firstMindsAgent(senderId);
+      const builderKey = getMindsBuilderKey(senderId);
+      const mindName = creds?.description ?? 'unknown';
 
       // If this looks like a confirmation, re-fetch Minds history to check for a pending action.
       // Using getHistory instead of in-memory state so handoffs survive bot restarts.
       let handoffText = null;
-      if (creds && isPositiveConfirmation(cleanText)) {
+      if (creds && builderKey && isPositiveConfirmation(cleanText)) {
         try {
-          const mindsClient = createMindsClient({ builderApiKey: creds.apiKey });
+          const mindsClient = createMindsClient({ builderApiKey: builderKey });
           const history = await mindsClient.getHistory(creds.alias, { limit: 10 });
           const lastMindReply = history.findLast((row) => isReplyHistoryRow(row));
           if (lastMindReply) {
@@ -2058,7 +2562,7 @@ tg.on(messageFilter('text'), async (ctx) => {
         accumulated = await runAnthropicLoop(contextId, handoffText, editor, toolCtx, anthKey?.apiKey ?? null);
         modelLabel = `${CLAUDE_MODEL} (via Minds)`;
       } else {
-        runMindsBackground(contextId, contextualText, chatId, pendingMsg.message_id, senderId, mindName)
+        runMindsBackground(contextId, contextualText, chatId, pendingMsg.message_id, senderId, creds)
           .catch((err) => console.error('[minds-bg] unhandled:', err.message));
         return;
       }
@@ -2088,10 +2592,15 @@ tg.on(messageFilter('text'), async (ctx) => {
     await editor.finalize(finalText);
 
   } catch (err) {
-    console.error(`[${provider}] error:`, err);
-    if (provider === 'gemini') { const h = getGeminiHistory(contextId); if (h.at(-1)?.role === 'user') h.pop(); }
-    else if (provider === 'openai' || provider === 'hermes') { const h = getOpenAIHistory(contextId); if (h.at(-1)?.role === 'user') h.pop(); }
-    else { const h = getAnthropicHistory(contextId); if (h.at(-1)?.role === 'user') h.pop(); }
+    console.error(`[${agent ? `agent:${agent.agent_name}` : provider}] error:`, err);
+    // Roll back the unpaired user message on the SAME key the turn used —
+    // an agent turn must not truncate the chat-level history, or vice versa.
+    const rollbackId = agent ? agentContextId(contextId, agent.agent_name) : contextId;
+    const rollbackProvider = agent ? agent.provider : provider;
+    if (rollbackProvider === 'gemini') { const h = getGeminiHistory(rollbackId); if (h.at(-1)?.role === 'user') h.pop(); }
+    else if (rollbackProvider === 'anthropic') { const h = getAnthropicHistory(rollbackId); if (h.at(-1)?.role === 'user') h.pop(); }
+    else if (agent || rollbackProvider === 'openai' || rollbackProvider === 'hermes') { const h = getOpenAIHistory(rollbackId); if (h.at(-1)?.role === 'user') h.pop(); }
+    else { const h = getAnthropicHistory(rollbackId); if (h.at(-1)?.role === 'user') h.pop(); }
     await editor.finalize(`⚠️ Error: ${err.message?.slice(0, 200) ?? 'Unknown error'}`);
   }
 
