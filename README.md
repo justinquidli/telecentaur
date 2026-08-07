@@ -12,14 +12,17 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 - **Channel watchers** — send tokens to the first person who types a trigger phrase in a group
 - **Cancel / reschedule** — manage pending scheduled drops and watchers
 - **Per-user API keys** — users can DM `/connect <key>` to link their own Quidli account
-- **Multi-LLM support** — switch between Claude, Gemini, OpenAI, OpenRouter, Hermes (Nous Portal, 200+ models), and Minds AI per chat
+- **Named agents** — create several agents, address them as `/tim`, `/max`, each with its own conversation
+- **Multiplayer** — in a group, everyone's agents work side by side; each runs on its owner's keys
+- **Multi-LLM support** — switch between Claude, Gemini, OpenAI, OpenRouter, Nous Portal (200+ models), and Minds AI per chat
 - **Bring your own key** — users DM `/llm <provider> <key>` to run on their own credits
 - **Minds AI handoff** — your personal Mind researches and plans; Claude executes on confirmation
 
 ## How it works
 
 ```
-Telegram message → LLM (Claude / Gemini / OpenAI / Minds AI)
+Telegram message → the chat's model, or a named agent you addressed as /name
+               → Claude / Gemini / OpenAI / OpenRouter / Nous Portal / your Mind / your own endpoint
                → Quidli Connect API (lookup / scores / drop)
                → edit Telegram reply in real time
 ```
@@ -72,7 +75,7 @@ cp .env.example .env
 | `BOT_OWNER_ID` | ✅* | Your Telegram user ID. Grants you the host Quidli wallet without `/connect`, **and** is the only account that can use the host's LLM keys by default. Leave it unset and nobody can — every user must bring their own key. Find it by messaging [@userinfobot](https://t.me/userinfobot). |
 | `BRAVE_SEARCH_API_KEY` | — | From [brave.com/search/api](https://brave.com/search/api) — required for web search and conditional drops |
 | `CLAUDE_MODEL` | — | Defaults to `claude-sonnet-4-6` |
-| `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, `openai`, or `hermes` |
+| `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, `openai`, or `nous` |
 | `GEMINI_API_KEY` | — | From [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `GEMINI_MODEL` | — | Defaults to `gemini-2.5-flash` |
 | `OPENAI_API_KEY` | — | From [platform.openai.com](https://platform.openai.com) |
@@ -103,6 +106,17 @@ pm2 start bot.js --name telecentaur
 pm2 save
 ```
 
+### 5. Before you push
+
+```bash
+npm run check     # syntax check + tests
+```
+
+Tests cover agent name slugging, addressing, key resolution, switch precedence, the
+Minds migration and the group ownership rules. `bot.js` connects to Telegram on import,
+so the tests extract the functions under test from its source rather than importing it —
+a stopgap until it's split into modules.
+
 ## Per-user API keys
 
 Users can link their own Quidli account so drops use their Smart Send wallet. Send these commands in a **private chat** with the bot:
@@ -114,6 +128,57 @@ Users can link their own Quidli account so drops use their Smart Send wallet. Se
 
 Keys are stored encrypted with AES-256-GCM.
 
+## Named agents
+
+An agent is a named configuration you address as a slash command. It can be backed by
+a model, one of your Minds, or your own OpenAI-compatible agent server. Each keeps its
+own conversation, so moving between them doesn't clobber anything.
+
+```
+/agent new bob            # then pick what it runs on from the buttons
+/agents                   # what you have, and where unprefixed messages go
+/bob what's up            # talk to it
+```
+
+Managing them:
+
+```
+/agent model bob <model-slug>       # e.g. anthropic/claude-sonnet-4.6
+/agent rename bob rig               # its conversation carries over
+/agent delete bob
+/agent endpoint rig <url> <key>     # your own Hermes API server, or anything OpenAI-compatible
+```
+
+Names double as Telegram commands, so they're lowercased to `a-z0-9_` — "Email Assistant"
+becomes `/email_assistant`. Rename it to something you'd actually type. Five stock agents
+(`/claude`, `/gemini`, `/openai`, `/nous`, `/openrouter`) exist without being created.
+
+Running `/minds <builder-key>` registers **every enabled Mind on your account** as its own
+agent, each with its own conversation thread.
+
+### In group chats
+
+Agents work in groups the bot is in. They're owned per-user, so your `/tim` is yours: it
+runs on your keys, replies are tagged `tim (@you)`, and nobody else can invoke it — someone
+else's `/tim` is a different agent entirely. Configuration stays in your DM, since it
+involves API keys.
+
+Agents can see recent messages *addressed to an agent*, plus agents' replies, so they can
+follow a conversation between several of them. Ordinary group chat is never sent to them.
+The bot posts a one-time notice in each group explaining this the first time an agent is used.
+
+### Which agent gets unprefixed messages
+
+In a DM, `switch to <name>` points bare messages at an agent until you switch away:
+
+```
+switch to tim          # unprefixed messages now go to tim
+switch to claude       # back to a model
+```
+
+This is per-person, so in a group your choice can't be changed by anyone else. In groups
+themselves the bot only sees messages addressed to it, so always name the agent there.
+
 ## Multi-LLM switching
 
 Switch the active LLM per chat at any time:
@@ -122,7 +187,7 @@ Switch the active LLM per chat at any time:
 switch to gemini
 switch to claude
 switch to openai
-switch to hermes
+switch to nous
 switch to openrouter
 ```
 
@@ -151,7 +216,7 @@ encrypted (set `MASTER_ENCRYPTION_KEY`) and used instead of the host's:
 /llm gemini <key>
 /llm openai <key>
 /llm openrouter <key> [model]
-/llm hermes <key> [model]
+/llm nous <key> [model]
 /llm_remove
 ```
 
@@ -161,22 +226,28 @@ encrypted (set `MASTER_ENCRYPTION_KEY`) and used instead of the host's:
 key. There's no host-level OpenRouter key: it's per-user only, so each person DMs `/llm openrouter
 <key>` first. Default model is `openai/gpt-4o`.
 
-### Hermes / Nous Portal
+### Nous Portal
 
-`switch to hermes` routes the chat through [Nous Portal](https://portal.nousresearch.com), an
+`switch to nous` (or `/nous`) routes through [Nous Portal](https://portal.nousresearch.com), an
 OpenAI-compatible gateway to 200+ models under one key. Set `NOUS_API_KEY` to give everyone the
 host default (`NOUS_MODEL`, defaults to `tencent/hy3:free` — free tier and supports tool calling).
 
 Users can bring their own key and choose any model by DMing the bot:
 
 ```
-/llm hermes <your-nous-key> anthropic/claude-sonnet-4.6
-/llm hermes <your-nous-key> tencent/hy3:free
+/llm nous <your-nous-key> anthropic/claude-sonnet-4.6
+/llm nous <your-nous-key> tencent/hy3:free
 ```
 
-Model slugs are vendor-prefixed; free variants end in `:free`. Note that Nous's own docs advise
-against the `Hermes-4-*` models for rapid tool-calling loops — prefer an agentic model for drops
-and lookups.
+Model slugs are vendor-prefixed; free variants end in `:free`. Portal serves models from every
+lab, not just Nous's own — the default above is a Tencent model, which is why the bot labels this
+provider "Nous Portal" rather than by any model family.
+
+Nous's docs advise against the `Hermes-4-*` models for rapid tool-calling loops — prefer an
+agentic model for drops and lookups.
+
+*Naming note:* this provider was called `hermes` before, so `/hermes`, `switch to hermes` and
+`/llm hermes <key>` all still work.
 
 ### Minds AI (experimental)
 
