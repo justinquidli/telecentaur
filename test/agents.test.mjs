@@ -200,6 +200,47 @@ test('switch phrases keep their meaning; agent names extend them', () => {
   assert.equal(route('should i switch to tim or not'), null, 'must not fire mid-sentence');
 });
 
+// ── Connect over MCP ─────────────────────────────────────────────────────────
+test('the MCP allowlist never duplicates a hardcoded tool', () => {
+  // Offering connect_lookup alongside quidli_lookup would leave the model
+  // choosing between two tools that do the same thing. This is the guard.
+  const allowlist = SRC.match(/const MCP_TOOL_ALLOWLIST = new Set\(\[([^\]]*)\]\)/)[1]
+    .split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean);
+
+  const hardcoded = [...SRC.matchAll(/^    name: '([a-z_]+)',$/gm)].map((m) => m[1]);
+  const duplicates = {
+    connect_lookup: 'quidli_lookup',
+    connect_drop: 'quidli_drop',
+    connect_lookup_exposed: 'quidli_exposed',
+    connect_scores_batch: 'quidli_score',
+    connect_scores_by_account: 'quidli_score',
+    connect_scores_by_username: 'quidli_score',
+  };
+
+  for (const name of allowlist) {
+    const clash = duplicates[name];
+    assert.ok(
+      !(clash && hardcoded.includes(clash)),
+      `${name} duplicates the hardcoded ${clash} — remove one before allowlisting`,
+    );
+  }
+  assert.ok(allowlist.length > 0, 'allowlist should not be empty');
+});
+
+test('MCP tool shape converts to what the provider converters expect', () => {
+  // MCP returns inputSchema; the bot's converters read input_schema.
+  const mcpTool = { name: 'connect_drop_balance', description: 'Balances.', inputSchema: { type: 'object', properties: { chainId: { type: 'number' } }, required: ['chainId'] } };
+  const converted = { name: mcpTool.name, description: mcpTool.description ?? '', input_schema: mcpTool.inputSchema };
+
+  // Mirrors getOpenAITools() / getGeminiTools() exactly.
+  const asOpenAI = { type: 'function', function: { name: converted.name, description: converted.description, parameters: converted.input_schema } };
+  const asGemini = { name: converted.name, description: converted.description, parameters: converted.input_schema };
+
+  assert.equal(asOpenAI.function.parameters.required[0], 'chainId');
+  assert.equal(asGemini.parameters.type, 'object');
+  assert.ok(converted.input_schema, 'input_schema must be populated or the model sees no arguments');
+});
+
 // ── Multi-owner groups ───────────────────────────────────────────────────────
 test('two members can own same-named agents without collision', () => {
   const db = new DatabaseSync(':memory:');

@@ -106,6 +106,12 @@ You are TeleCentaur, a Telegram bot that sends crypto tokens to people using Qui
 - Only ask the user for more info after you've exhausted all tool options.
 - Be concise. One sentence for success, one sentence for failure.
 
+## Checking balance (connect_drop_balance)
+- Use connect_drop_balance to answer "what's my balance", "how much do I have", "can I afford X". It takes a chainId (8453 = Base) and returns native and ERC-20 balances for the sender's Smart Send wallet.
+- Balances come back as balanceInWei with a decimals field — divide before showing a human number, and use the symbol from the response.
+- Before a drop that looks large, or after a drop fails for funding reasons, check the balance and say plainly what's short — the token or the gas.
+- Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
+
 ## Sending tokens (quidli_drop)
 - ALWAYS call quidli_lookup for every recipient FIRST, before calling quidli_drop.
 - Email, phone, Twitter/X, and Farcaster recipients: quidli_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call quidli_lookup again with the same payload (wait ~2s between tries, up to ~10 tries) until it returns "completed". This is expected and means a wallet is being created; do not give up early.
@@ -1056,6 +1062,64 @@ const RECIPIENT_SCHEMA = {
   required: ['type'],
 };
 
+// ── Quidli Connect over MCP ───────────────────────────────────────────────────
+// Tools here are discovered from mcp.connect.quid.li rather than hand-written,
+// so new Connect capabilities appear without a code change. The allowlist is
+// deliberate: connect_lookup / connect_drop / connect_scores_* duplicate the
+// hardcoded quidli_* tools below, and offering both would leave the model
+// choosing between two tools that do the same thing.
+//
+// The server is stateless and reads x-api-key per request, so each call is made
+// with the *sender's* key — same per-user model as the REST path.
+const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
+const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance']);
+const mcpToolNames = new Set();
+
+async function withMcpClient(apiKey, fn) {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
+    requestInit: { headers: { 'x-api-key': apiKey } },
+  });
+  const client = new Client({ name: 'telecentaur', version: '1.0.0' }, { capabilities: {} });
+  try {
+    await client.connect(transport);
+    return await fn(client);
+  } finally {
+    await client.close().catch(() => {});
+  }
+}
+
+async function mcpCallTool(name, args, apiKey) {
+  return withMcpClient(apiKey, async (client) => {
+    const res = await client.callTool({ name, arguments: args ?? {} });
+    const text = (res.content ?? [])
+      .filter((c) => c.type === 'text')
+      .map((c) => c.text)
+      .join('\n');
+    if (res.isError) throw new Error(text || 'MCP tool error');
+    return text || JSON.stringify(res.structuredContent ?? {});
+  });
+}
+
+// Discovered once at startup using the host key — reads schemas only, no side
+// effects. If Connect's MCP is unreachable the bot starts normally with the
+// hardcoded tools; these are additive, so nothing existing depends on them.
+async function registerMcpTools() {
+  if (!QUIDLI_API_KEY) return;
+  try {
+    const discovered = await withMcpClient(QUIDLI_API_KEY, (c) => c.listTools());
+    for (const t of discovered.tools ?? []) {
+      if (!MCP_TOOL_ALLOWLIST.has(t.name)) continue;
+      tools.push({ name: t.name, description: t.description ?? '', input_schema: t.inputSchema });
+      mcpToolNames.add(t.name);
+    }
+    console.log(`   Connect MCP: ${mcpToolNames.size ? [...mcpToolNames].join(', ') : 'no allowlisted tools found'}`);
+  } catch (err) {
+    console.error('[mcp] tool discovery failed, continuing without it:', err.message);
+  }
+}
+
 const tools = [
   {
     name: 'web_search',
@@ -1285,6 +1349,18 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
 
 async function runTool(name, input, { senderId, senderApiKey, currentChatId, isPrivateChat } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
+
+  // Tools discovered from Connect's MCP. Called with the sender's own key, so
+  // the per-user model is identical to the REST path — the owner falls back to
+  // the host key exactly as drops do.
+  if (mcpToolNames.has(name)) {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) {
+      return 'Error: you need to connect your own Quidli account first — DM me /connect <your-api-key> (get one at connect.quid.li).';
+    }
+    return await mcpCallTool(name, input, keyToUse);
+  }
 
   if (name === 'web_search') {
     return JSON.stringify(await braveSearch(input.query), null, 2);
@@ -2939,6 +3015,8 @@ tg.launch({
   console.log(`   Key storage: ${encKey ? 'encrypted (AES-256-GCM)' : '⚠️  plaintext — set MASTER_ENCRYPTION_KEY to encrypt'}`);
   loadPendingDrops();
   loadPendingClaims();
+  // Additive and non-blocking — a failure here leaves the hardcoded tools intact.
+  registerMcpTools();
 });
 
 process.once('SIGINT', () => tg.stop('SIGINT'));

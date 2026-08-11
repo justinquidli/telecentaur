@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@animocabrands/minds-client-lib": "latest",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@anthropic-ai/sdk": "^0.39.0",
     "@google/genai": "^0.7.0",
     "dotenv": "^16.0.0",
