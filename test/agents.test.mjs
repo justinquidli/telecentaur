@@ -458,3 +458,27 @@ test('a mistyped agent name suggests the right one', () => {
     assert.equal(suggest(cmd), null, `/${cmd} must stay silent`);
   }
 });
+
+// ── Startup wiring ────────────────────────────────────────────────────────────
+// Telegraf's launch() promise resolves when the bot STOPS, not when it starts
+// (in long-polling mode it awaits startPolling()). Startup work placed in
+// .then() therefore runs at shutdown. That shipped, and it silently disabled
+// pending-drop restore, pending-claim restore, and MCP tool discovery — the
+// symptom was the model reporting connect_drop_balance as unavailable while
+// the startup banner appeared in the logs (printed by the dying process).
+test('startup work runs in the onLaunch callback, not launch().then()', () => {
+  const launch = SRC.match(/tg\.launch\(\{[\s\S]*?\n\}\)(?:\.catch\([\s\S]*?\n\}\))?;/);
+  assert.ok(launch, 'could not find the tg.launch(...) call in bot.js');
+  const block = launch[0];
+
+  assert.ok(
+    !/\}\)\.then\(/.test(block),
+    'startup work is attached to launch().then() — that promise only resolves on shutdown, ' +
+      'so this code will never run at startup. Use the onLaunch callback (2nd arg) instead.',
+  );
+  assert.match(block, /\},\s*\(\)\s*=>\s*\{/, 'launch() should take an onLaunch callback as its 2nd argument');
+
+  for (const fn of ['loadPendingDrops', 'loadPendingClaims', 'registerMcpTools']) {
+    assert.ok(block.includes(`${fn}()`), `${fn}() should be called during startup`);
+  }
+});

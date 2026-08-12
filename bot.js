@@ -3013,9 +3013,14 @@ tg.on(messageFilter('text'), async (ctx) => {
 
 // ─── Launch ───────────────────────────────────────────────────────────────────
 
+// NOTE: launch()'s promise does NOT resolve on startup — in long-polling mode it
+// awaits startPolling(), so it only settles when the bot STOPS. Startup work must
+// go in the onLaunch callback (2nd arg), which fires right after getMe().
+// Putting it in .then() means it runs at shutdown, which silently disabled
+// loadPendingDrops/loadPendingClaims/registerMcpTools.
 tg.launch({
   allowedUpdates: ['message', 'callback_query'],
-}).then(() => {
+}, () => {
   console.log(`✅ TeleCentaur ready — @${tg.botInfo?.username}`);
   console.log(`   Default LLM: ${DEFAULT_LLM_PROVIDER}`);
   if (GEMINI_API_KEY) console.log(`   Gemini: ${GEMINI_MODEL} ✓`);
@@ -3028,6 +3033,9 @@ tg.launch({
   loadPendingClaims();
   // Additive and non-blocking — a failure here leaves the hardcoded tools intact.
   registerMcpTools();
+}).catch((err) => {
+  console.error('[launch] Telegram launch failed:', err?.message || err);
+  process.exit(1);
 });
 
 process.once('SIGINT', () => tg.stop('SIGINT'));
