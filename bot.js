@@ -1075,31 +1075,42 @@ const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
 const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance']);
 const mcpToolNames = new Set();
 
-async function withMcpClient(apiKey, fn) {
-  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
-  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
-  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
-    requestInit: { headers: { 'x-api-key': apiKey } },
-  });
-  const client = new Client({ name: 'telecentaur', version: '1.0.0' }, { capabilities: {} });
+// Plain JSON-RPC over POST rather than the MCP SDK. The server is stateless —
+// it builds a fresh transport per request and needs no initialize handshake, so
+// tools/list and tools/call work as one-shot POSTs. The SDK's Streamable HTTP
+// client hangs against it (it negotiates a session this server never issues),
+// and skipping it also avoids 85 dependencies for four lines of protocol.
+async function mcpRpc(method, params, apiKey, timeoutMs = 20000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    await client.connect(transport);
-    return await fn(client);
+    const res = await fetch(MCP_URL, {
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params: params ?? {} }),
+      signal: ac.signal,
+    });
+    if (!res.ok) throw new Error(`MCP ${method} HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = await res.json();
+    if (json.error) throw new Error(json.error.message || `MCP ${method} error`);
+    return json.result;
   } finally {
-    await client.close().catch(() => {});
+    clearTimeout(timer);
   }
 }
 
 async function mcpCallTool(name, args, apiKey) {
-  return withMcpClient(apiKey, async (client) => {
-    const res = await client.callTool({ name, arguments: args ?? {} });
-    const text = (res.content ?? [])
-      .filter((c) => c.type === 'text')
-      .map((c) => c.text)
-      .join('\n');
-    if (res.isError) throw new Error(text || 'MCP tool error');
-    return text || JSON.stringify(res.structuredContent ?? {});
-  });
+  const res = await mcpRpc('tools/call', { name, arguments: args ?? {} }, apiKey);
+  const text = (res?.content ?? [])
+    .filter((c) => c.type === 'text')
+    .map((c) => c.text)
+    .join('\n');
+  if (res?.isError) throw new Error(text || 'MCP tool error');
+  return text || JSON.stringify(res?.structuredContent ?? {});
 }
 
 // Discovered once at startup using the host key — reads schemas only, no side
@@ -1108,8 +1119,8 @@ async function mcpCallTool(name, args, apiKey) {
 async function registerMcpTools() {
   if (!QUIDLI_API_KEY) return;
   try {
-    const discovered = await withMcpClient(QUIDLI_API_KEY, (c) => c.listTools());
-    for (const t of discovered.tools ?? []) {
+    const discovered = await mcpRpc('tools/list', {}, QUIDLI_API_KEY);
+    for (const t of discovered?.tools ?? []) {
       if (!MCP_TOOL_ALLOWLIST.has(t.name)) continue;
       tools.push({ name: t.name, description: t.description ?? '', input_schema: t.inputSchema });
       mcpToolNames.add(t.name);

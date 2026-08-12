@@ -227,6 +227,43 @@ test('the MCP allowlist never duplicates a hardcoded tool', () => {
   assert.ok(allowlist.length > 0, 'allowlist should not be empty');
 });
 
+test('MCP JSON-RPC calls parse results, errors and timeouts', async () => {
+  // The SDK's Streamable HTTP client hangs against this server (it negotiates a
+  // session the server never issues), so we speak JSON-RPC directly. These are
+  // the response shapes that come back.
+  const env = build(
+    ['const MCP_URL = "https://mcp.example/";', grab('mcpRpc'), grab('mcpCallTool')].join('\n'),
+    '{ mcpRpc, mcpCallTool }',
+    { fetch: async (_url, init) => {
+        const body = JSON.parse(init.body);
+        if (body.method === 'tools/list') {
+          return { ok: true, json: async () => ({ result: { tools: [{ name: 'connect_drop_balance' }] } }) };
+        }
+        if (body.params?.name === 'boom') {
+          return { ok: true, json: async () => ({ result: { isError: true, content: [{ type: 'text', text: 'no funds' }] } }) };
+        }
+        if (body.params?.name === 'structured') {
+          return { ok: true, json: async () => ({ result: { content: [], structuredContent: { assets: [] } } }) };
+        }
+        if (body.params?.name === 'rpcerror') {
+          return { ok: true, json: async () => ({ error: { message: 'bad key' } }) };
+        }
+        if (body.params?.name === 'http500') {
+          return { ok: false, status: 500, text: async () => 'upstream down' };
+        }
+        return { ok: true, json: async () => ({ result: { content: [{ type: 'text', text: '{"assets":[]}' }] } }) };
+      },
+      AbortController, setTimeout, clearTimeout },
+  );
+
+  assert.deepEqual((await env.mcpRpc('tools/list', {}, 'k')).tools[0].name, 'connect_drop_balance');
+  assert.equal(await env.mcpCallTool('connect_drop_balance', { chainId: 8453 }, 'k'), '{"assets":[]}');
+  assert.equal(await env.mcpCallTool('structured', {}, 'k'), '{"assets":[]}', 'falls back to structuredContent');
+  await assert.rejects(() => env.mcpCallTool('boom', {}, 'k'), /no funds/, 'isError surfaces the text');
+  await assert.rejects(() => env.mcpCallTool('rpcerror', {}, 'k'), /bad key/, 'JSON-RPC error surfaces');
+  await assert.rejects(() => env.mcpCallTool('http500', {}, 'k'), /HTTP 500/, 'HTTP failure surfaces');
+});
+
 test('MCP tool shape converts to what the provider converters expect', () => {
   // MCP returns inputSchema; the bot's converters read input_schema.
   const mcpTool = { name: 'connect_drop_balance', description: 'Balances.', inputSchema: { type: 'object', properties: { chainId: { type: 'number' } }, required: ['chainId'] } };
