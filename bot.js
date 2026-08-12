@@ -113,19 +113,19 @@ You are TeleCentaur, a Telegram bot that sends crypto tokens to people using Qui
 - Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
 
 ## Sending tokens (quidli_drop)
-- ALWAYS call quidli_lookup for every recipient FIRST, before calling quidli_drop.
-- Email, phone, Twitter/X, and Farcaster recipients: quidli_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call quidli_lookup again with the same payload (wait ~2s between tries, up to ~10 tries) until it returns "completed". This is expected and means a wallet is being created; do not give up early.
+- ALWAYS call connect_lookup for every recipient FIRST, before calling quidli_drop.
+- Email, phone, Twitter/X, and Farcaster recipients: connect_lookup auto-generates a wallet for them even if they've never used Quidli before — it works for ANY real, existing account on these platforms, not just ones already linked to Quidli. The first call often returns status "processing" — call connect_lookup again with the same identical payload (wait ~2s between tries, up to 5 tries) until it returns "completed". Each retry is a real tool round, so do not exceed 5. This is expected and means a wallet is being created; do not give up early.
 - Telegram recipients are different: Telegram's platform does not allow looking up an arbitrary @username unless that person has already interacted with a bot, or Quidli already has their numeric Telegram ID some other way. This means a raw Telegram @username with no prior bot interaction will fail immediately (status "completed" with them in "failed") even if it's a real, famous account — this is NOT something retrying will fix.
-- For Telegram usernames specifically: ALWAYS call resolve_telegram_username FIRST before quidli_lookup/quidli_drop. It checks every chat this bot has seen them post in and returns their numeric ID if found — use that ID (not the username) for quidli_lookup and quidli_drop.
-- If resolve_telegram_username finds nothing AND quidli_lookup/quidli_drop confirms the username can't be resolved: do NOT just tell the user to wait around. Call create_pending_claim with the recipient's username and the drop details instead. This returns a one-tap claim link. If you're in a group chat, the tool automatically posts the link directly, tagging the recipient — just tell the requester it's done, no need to forward anything. If you're in a DM, the bot has no way to reach the recipient directly, so tell the requester to forward the link themselves. Either way, once the recipient taps it, their wallet resolves and the drop executes automatically — no further action needed from anyone after that tap. Always prefer offering this claim link over saying "ask them to connect" or "ask them to message me" — it's faster and requires only one tap from the recipient.
+- For Telegram usernames specifically: ALWAYS call resolve_telegram_username FIRST before connect_lookup/quidli_drop. It checks every chat this bot has seen them post in and returns their numeric ID if found — use that ID (not the username) for connect_lookup and quidli_drop.
+- If resolve_telegram_username finds nothing AND connect_lookup/quidli_drop confirms the username can't be resolved: do NOT just tell the user to wait around. Call create_pending_claim with the recipient's username and the drop details instead. This returns a one-tap claim link. If you're in a group chat, the tool automatically posts the link directly, tagging the recipient — just tell the requester it's done, no need to forward anything. If you're in a DM, the bot has no way to reach the recipient directly, so tell the requester to forward the link themselves. Either way, once the recipient taps it, their wallet resolves and the drop executes automatically — no further action needed from anyone after that tap. Always prefer offering this claim link over saying "ask them to connect" or "ask them to message me" — it's faster and requires only one tap from the recipient.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
 - Always generate a fresh UUID for idempotencyKey.
 - After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
 - If create_pending_claim also fails (no Quidli key connected), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
 
-## Looking up wallets (quidli_lookup)
-Call quidli_lookup whenever the user asks for a wallet address, AND always before every quidli_drop (see above). For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
+## Looking up wallets (connect_lookup)
+Call connect_lookup whenever the user asks for a wallet address, AND always before every quidli_drop (see above). It returns the full response — status, results, and failed — so when some recipients land in "failed", say which ones by name rather than reporting a blanket failure. For email/phone/Twitter/Farcaster, keep retrying while status is "processing" — it's actively generating a wallet, and will succeed even for people who've never used Quidli. For Telegram usernames, an immediate "completed" + "failed" response is final unless you have their numeric ID instead.
 
 Supported identity types: discord, farcaster, twitter, telegram, email, github, linkedin, phone.
 
@@ -989,36 +989,6 @@ async function quidliFetch(path, options = {}, apiKey = QUIDLI_API_KEY) {
   return res;
 }
 
-async function quidliLookup(recipients) {
-  const res = await quidliFetch('/lookup', { method: 'POST', body: JSON.stringify({ recipients }) });
-  const data = await res.json();
-  if (data.status === 'completed') {
-    console.log('[quidli_lookup] completed response:', JSON.stringify(data));
-    return data.results;
-  }
-
-  const pendingId = data.pendingRequestId ?? data.requestId ?? data.id ?? data.jobId ?? null;
-  if (data.status === 'processing') {
-    if (!pendingId) {
-      console.error('[quidli_lookup] processing status but no recognizable pending-id field. Raw response:', JSON.stringify(data));
-    } else {
-      for (let i = 0; i < 10; i++) {
-        await new Promise((r) => setTimeout(r, 2000));
-        const followUp = await quidliFetch(`/lookup/follow-up/${pendingId}`);
-        const followData = await followUp.json();
-        if (followData.status === 'completed') {
-          const retry = await quidliFetch('/lookup', { method: 'POST', body: JSON.stringify({ recipients }) });
-          const retryData = await retry.json();
-          return retryData.results ?? [];
-        }
-      }
-      throw new Error('Lookup timed out after processing');
-    }
-  }
-  console.error('[quidli_lookup] unexpected response:', JSON.stringify(data));
-  throw new Error(`Unexpected lookup status: ${data.status}`);
-}
-
 async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
   recipients = recipients.map(({ type, id, username }) => {
     if (id) return { type, id };
@@ -1065,7 +1035,7 @@ const RECIPIENT_SCHEMA = {
 // The server is stateless and reads x-api-key per request, so each call is made
 // with the *sender's* key — same per-user model as the REST path.
 const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
-const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch']);
+const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch', 'connect_lookup']);
 const mcpToolNames = new Set();
 
 // Plain JSON-RPC over POST rather than the MCP SDK. The server is stateless —
@@ -1139,15 +1109,8 @@ const tools = [
       required: ['query'],
     },
   },
-  {
-    name: 'quidli_lookup',
-    description: 'Look up wallet addresses for people by their social identity (Telegram, Twitter, email, Farcaster, GitHub, Discord, LinkedIn, phone). Use when someone asks for a wallet address.',
-    input_schema: {
-      type: 'object',
-      properties: { recipients: { type: 'array', items: RECIPIENT_SCHEMA } },
-      required: ['recipients'],
-    },
-  },
+  // NOTE: wallet lookup is no longer defined here — it comes from Connect's
+  // MCP server as connect_lookup, discovered at startup. See MCP_TOOL_ALLOWLIST.
   {
     name: 'quidli_drop',
     description: 'Send tokens to one or more people by their social identity using Quidli Smart Send. Use whenever someone asks to send, tip, or drop tokens/USDC.',
@@ -1283,7 +1246,7 @@ const tools = [
   },
   {
     name: 'resolve_telegram_username',
-    description: 'Resolve a Telegram @username to its numeric Telegram ID by checking every group chat this bot has ever seen them post in. ALWAYS try this BEFORE calling quidli_lookup/quidli_drop with a raw Telegram username, since Telegram itself does not let Quidli resolve arbitrary usernames — only numeric IDs work reliably. If this returns a numeric ID, use { type: "telegram", id: "<id>" } for quidli_lookup and quidli_drop instead of username. If it returns nothing, the bot has never seen that user active anywhere, and you should tell the requester to ask them to DM this bot directly (any message, even just "hi") — after they do, this will resolve them.',
+    description: 'Resolve a Telegram @username to its numeric Telegram ID by checking every group chat this bot has ever seen them post in. ALWAYS try this BEFORE calling connect_lookup/quidli_drop with a raw Telegram username, since Telegram itself does not let Quidli resolve arbitrary usernames — only numeric IDs work reliably. If this returns a numeric ID, use { type: "telegram", id: "<id>" } for connect_lookup and quidli_drop instead of username. If it returns nothing, the bot has never seen that user active anywhere, and you should tell the requester to ask them to DM this bot directly (any message, even just "hi") — after they do, this will resolve them.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1349,9 +1312,6 @@ async function runTool(name, input, { senderId, senderApiKey, currentChatId, isP
     return JSON.stringify(await braveSearch(input.query), null, 2);
   }
 
-  if (name === 'quidli_lookup') {
-    return JSON.stringify(await quidliLookup(input.recipients), null, 2);
-  }
 
   if (name === 'quidli_drop') {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
@@ -1469,7 +1429,7 @@ async function runTool(name, input, { senderId, senderApiKey, currentChatId, isP
   if (name === 'resolve_telegram_username') {
     const telegramId = findUserIdByUsername(input.username);
     if (telegramId) {
-      return JSON.stringify({ found: true, telegramId, note: `Use { type: "telegram", id: "${telegramId}" } for quidli_lookup/quidli_drop.` });
+      return JSON.stringify({ found: true, telegramId, note: `Use { type: "telegram", id: "${telegramId}" } for connect_lookup/quidli_drop.` });
     }
     return JSON.stringify({
       found: false,
