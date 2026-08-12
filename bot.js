@@ -144,15 +144,15 @@ Use quidli_exposed when someone asks what accounts a person has linked, or when 
 ## Identity summary ("tell me about myself", "who am I?")
 When someone asks about themselves — "tell me about myself", "who am I?", "what do you know about me?", "summarize my profile", "based on my socials" — do ALL of the following:
 1. Call quidli_exposed with their Telegram ID (from the message context) to get all linked accounts
-2. Call quidli_score with their Telegram ID to get their web3 reputation scores
+2. Call connect_scores_batch with their Telegram ID to get their web3 reputation scores
 3. For each professional/social platform in the exposed results (GitHub, LinkedIn, Twitter, Farcaster), call web_search to look up their public profile — find their employer, job title, notable projects, bio, or anything publicly known about them
 Then synthesize everything into a warm, conversational paragraph: who they are professionally, what they build or work on, their on-chain presence and wallet addresses, and their reputation standing. Make it feel like a smart introduction, not a data dump. If LinkedIn or GitHub is linked, lean into those for professional context.
 
 ## Resolving Telegram mentions
 Every message includes context like: "@username (Telegram ID: 123456789)". Always extract and use the Telegram ID when available — it's more reliable than usernames. If only a username is available, use quidli_exposed to resolve it first.
 
-## Checking reputation (quidli_score)
-Use quidli_score when asked about trust, reputation, or scores. Pass the most specific identity available.
+## Checking reputation (connect_scores_batch)
+Use connect_scores_batch when asked about trust, reputation, or scores. Pass the most specific identity available. It takes a users array, so score several people in one call rather than one call each — and it accepts an optional filter with minScore to return only people above a threshold.
 
 ## Web search (web_search)
 Use web_search for any real-world facts: prices, scores, event results, news. Always search before answering factual questions about the world.
@@ -1034,13 +1034,6 @@ async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453,
   return res.json();
 }
 
-async function quidliScore({ users, filter }) {
-  const body = { users };
-  if (filter) body.filter = filter;
-  const res = await quidliFetch('/scores', { method: 'POST', body: JSON.stringify(body) });
-  return res.json();
-}
-
 async function quidliExposed(recipient) {
   const res = await quidliFetch('/lookup/exposed', { method: 'POST', body: JSON.stringify({ recipient }) });
   return res.json();
@@ -1072,7 +1065,7 @@ const RECIPIENT_SCHEMA = {
 // The server is stateless and reads x-api-key per request, so each call is made
 // with the *sender's* key — same per-user model as the REST path.
 const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
-const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance']);
+const MCP_TOOL_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch']);
 const mcpToolNames = new Set();
 
 // Plain JSON-RPC over POST rather than the MCP SDK. The server is stateless —
@@ -1125,6 +1118,11 @@ async function registerMcpTools() {
       tools.push({ name: t.name, description: t.description ?? '', input_schema: t.inputSchema });
       mcpToolNames.add(t.name);
     }
+    // An allowlisted tool that doesn't come back means Connect renamed or pulled
+    // it. Some of these replace hardcoded tools, so a silent miss is a capability
+    // that just disappears — say so loudly.
+    const missing = [...MCP_TOOL_ALLOWLIST].filter((n) => !mcpToolNames.has(n));
+    if (missing.length) console.error(`[mcp] ⚠️  allowlisted but NOT offered by the server: ${missing.join(', ')}`);
     console.log(`   Connect MCP: ${mcpToolNames.size ? [...mcpToolNames].join(', ') : 'no allowlisted tools found'}`);
   } catch (err) {
     console.error('[mcp] tool discovery failed, continuing without it:', err.message);
@@ -1164,34 +1162,8 @@ const tools = [
       required: ['recipients', 'amountInWeiPerRecipient', 'tokenContract'],
     },
   },
-  {
-    name: 'quidli_score',
-    description: 'Get the web3 reputation/social score for a user. Accepts any social identity.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        users: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              type: { type: 'string', enum: ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin'] },
-              id: { type: 'string' },
-            },
-            required: ['type'],
-          },
-        },
-        filter: {
-          type: 'object',
-          properties: {
-            type: { type: 'string', enum: ['quidli_score', 'lens_score', 'neynar_score', 'ethos_twitter_reputation', 'ethos_wallet_reputation'] },
-            minScore: { type: 'number' },
-          },
-        },
-      },
-      required: ['users'],
-    },
-  },
+  // NOTE: reputation scores are no longer defined here — they come from Connect's
+  // MCP server as connect_scores_batch, discovered at startup. See MCP_TOOL_ALLOWLIST.
   {
     name: 'schedule_drop',
     description: 'Schedule a token drop to execute at a future time. Use when someone says "send X in N minutes/hours".',
@@ -1368,7 +1340,7 @@ async function runTool(name, input, { senderId, senderApiKey, currentChatId, isP
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
     if (!keyToUse) {
-      return 'Error: you need to connect your own Quidli account first — DM me /connect <your-api-key> (get one at connect.quid.li).';
+      return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me /connect <your-key> to link it. Takes a minute, and it only has to be done once.';
     }
     return await mcpCallTool(name, input, keyToUse);
   }
@@ -1394,10 +1366,6 @@ async function runTool(name, input, { senderId, senderApiKey, currentChatId, isP
     }
     console.log('[drop] result:', JSON.stringify(result, null, 2));
     return JSON.stringify(result, null, 2);
-  }
-
-  if (name === 'quidli_score') {
-    return JSON.stringify(await quidliScore(input), null, 2);
   }
 
   if (name === 'quidli_exposed') {
