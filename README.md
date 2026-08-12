@@ -7,6 +7,7 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 - **Send tokens** — drop USDC or other tokens to anyone by Telegram handle, email, Twitter, Farcaster, and more
 - **Look up wallets** — resolve any social identity to an ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos)
+- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails
 - **Schedule drops** — send tokens at a future time, surviving bot restarts
 - **Conditional drops** — "if BTC is above $100k, send 1 USDC to @alice" — evaluated automatically using real-time web search
 - **Channel watchers** — send tokens to the first person who types a trigger phrase in a group
@@ -23,7 +24,9 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 ```
 Telegram message → the chat's model, or a named agent you addressed as /name
                → Claude / Gemini / OpenAI / OpenRouter / Nous Portal / your Mind / your own endpoint
-               → Quidli Connect API (lookup / scores / drop)
+               → Quidli Connect, over two paths:
+                   • MCP  — lookup / scores / balance (discovered at runtime)
+                   • REST — drop / exposed / claims / scheduling
                → edit Telegram reply in real time
 ```
 
@@ -31,6 +34,7 @@ Telegram message → the chat's model, or a named agent you addressed as /name
 ```
 send 1 USDC to @ysiu on Twitter
 what's the wallet for vitalik.eth on Farcaster?
+what's my balance on base?
 schedule a drop of 5 USDC to @alice in 2 hours
 if ETH hits $5000 today, send 0.5 USDC to @bob
 send 0.01 USDC to the first person who types "gm" here today
@@ -84,7 +88,7 @@ cp .env.example .env
 | `NOUS_MODEL` | — | Defaults to `tencent/hy3:free` (free tier, supports tool calling) |
 | `HOST_KEY_ALLOWED_USERS` | — | Handles/IDs allowed to spend the host's LLM keys. Empty = owner only |
 | `TELEGRAM_ALLOWED_USERS` | — | Comma-separated Telegram user IDs allowed to use the bot. Empty = everyone |
-| `BOT_WALLET_PRIVATE_KEY` | — | Private key of a funded wallet for x402 pay-per-request on `/lookup` |
+| `BOT_WALLET_PRIVATE_KEY` | — | Private key of a funded wallet for x402 pay-per-request. Note: lookup, scores and balance now go over MCP, which authenticates by API key only — so x402 no longer covers them |
 | `SYSTEM_PROMPT` | — | Override the default system prompt |
 
 ### 3. Enable Smart Send (for token drops)
@@ -127,6 +131,48 @@ Users can link their own Quidli account so drops use their Smart Send wallet. Se
 ```
 
 Keys are stored encrypted with AES-256-GCM.
+
+**Note:** wallet lookup, reputation scores and balance run on the *asker's* key (see below), so
+users who haven't run `/connect` will be prompted to. Drops already required a key, so this
+makes the whole Connect surface consistent rather than adding a new gate.
+
+## Quidli Connect over MCP
+
+Connect exposes itself as an MCP server, and the bot consumes part of its surface that way
+rather than hand-writing REST calls. Three tools are discovered at startup:
+
+| Tool | Replaces |
+|---|---|
+| `connect_lookup` | the old hand-written `quidli_lookup` |
+| `connect_scores_batch` | the old hand-written `quidli_score` |
+| `connect_drop_balance` | nothing — new capability |
+
+How it works:
+
+- `MCP_TOOL_ALLOWLIST` in `bot.js` controls which discovered tools are offered. It's deliberately
+  narrow: Connect also exposes `connect_drop`, which would duplicate the hardcoded `quidli_drop`
+  and leave the model choosing between two tools that do the same thing.
+- Discovery happens once at startup via plain JSON-RPC over POST. The server is stateless and
+  reads `x-api-key` per request, so there's no initialize handshake and no MCP SDK dependency.
+- Each call uses the **sender's** key. The host key is used only for the bot owner, the same rule
+  the REST tools follow.
+- If Connect is unreachable at startup the bot runs normally on the hardcoded tools. If an
+  allowlisted tool is missing from discovery, startup logs a loud warning — some of these
+  *replace* hardcoded tools, so a silent miss would quietly delete a capability.
+
+Point it elsewhere with `CONNECT_MCP_URL` (defaults to `https://mcp.connect.quid.li/`).
+
+To add another Connect tool: add its name to `MCP_TOOL_ALLOWLIST`, delete the hardcoded
+equivalent if there is one, and update the system prompt to reference the new tool name.
+Check the live names first:
+
+```bash
+curl -s -X POST https://mcp.connect.quid.li/ \
+  -H "x-api-key: $QUIDLI_API_KEY" \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -o '"name":"[a-z_]*"'
+```
 
 ## Named agents
 
@@ -323,3 +369,12 @@ request, or switch providers — nothing after the cap was executed.
 **Conditional drop fires at wrong time:** Make sure `BRAVE_SEARCH_API_KEY` is set.
 
 **Gemini not calling tools:** Known limitation. Switch back to Claude for drops, lookups, or scheduling.
+
+**Model says a tool "isn't available" that startup logged as registered:** Check the startup
+banner is coming from the *running* process. Telegraf's `launch()` promise does not resolve on
+startup — in long-polling mode it awaits `startPolling()`, so it only settles when the bot
+**stops**. Startup work in `.then()` therefore runs at shutdown, and after a `pm2 restart` you'll
+see the banner printed by the dying process while the new one silently ran none of it. Startup
+work belongs in the `onLaunch` callback (2nd argument to `launch()`). There's a test for this in
+`test/agents.test.mjs`; this bug silently disabled MCP discovery, pending-drop restore and
+pending-claim restore.
