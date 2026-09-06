@@ -482,3 +482,38 @@ test('startup work runs in the onLaunch callback, not launch().then()', () => {
     assert.ok(block.includes(`${fn}()`), `${fn}() should be called during startup`);
   }
 });
+
+// ── connect_me redaction ──────────────────────────────────────────────────────
+// connect_me returns the caller's FULL profile: every linked account, including
+// ones flagged exposed:false — phone number, email, every wallet. The bot passes
+// MCP tool output straight to the model, so without this filter a group chat can
+// have someone's phone number read aloud.
+test('connect_me output drops accounts the user kept private', () => {
+  const redact = new Function(`${grab('redactConnectMe')}; return redactConnectMe;`)();
+
+  const raw = JSON.stringify({
+    profile: { username: 'justin', scores: { quidliScore: 99 } },
+    accounts: [
+      { platform: 'phone', socialId: '+33600000000', exposed: false },
+      { platform: 'email', socialId: 'someone@example.com', exposed: false },
+      { platform: 'wallet', socialId: '0xdeadbeef', exposed: false },
+      { platform: 'github', username: 'justinquidli', exposed: true },
+      { platform: 'farcaster', username: 'ahn.eth', exposed: true },
+    ],
+  });
+
+  const out = redact(raw);
+  assert.ok(!out.includes('+33600000000'), 'phone number must not reach the model');
+  assert.ok(!out.includes('someone@example.com'), 'email must not reach the model');
+  assert.ok(!out.includes('0xdeadbeef'), 'private wallet must not reach the model');
+  assert.ok(out.includes('justinquidli') && out.includes('ahn.eth'), 'exposed accounts should survive');
+  assert.equal(JSON.parse(out).accounts.length, 2);
+  assert.equal(JSON.parse(out).profile.scores.quidliScore, 99, 'profile and scores are kept');
+});
+
+test('connect_me redaction fails closed on an unexpected shape', () => {
+  const redact = new Function(`${grab('redactConnectMe')}; return redactConnectMe;`)();
+  const out = redact('<html>gateway error</html>');
+  assert.ok(!out.includes('gateway error'), 'unparseable responses must not be passed through verbatim');
+  assert.match(out, /withheld/i);
+});
