@@ -201,10 +201,10 @@ test('switch phrases keep their meaning; agent names extend them', () => {
 });
 
 // ── Connect over MCP ─────────────────────────────────────────────────────────
-test('the MCP allowlist never duplicates a hardcoded tool', () => {
+test('the MCP fallback allowlist never duplicates a hardcoded tool', () => {
   // Offering connect_lookup alongside quidli_lookup would leave the model
   // choosing between two tools that do the same thing. This is the guard.
-  const allowlist = SRC.match(/const MCP_TOOL_ALLOWLIST = new Set\(\[([^\]]*)\]\)/)[1]
+  const allowlist = SRC.match(/const MCP_LEGACY_ALLOWLIST = new Set\(\[([^\]]*)\]\)/)[1]
     .split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean);
 
   const hardcoded = [...SRC.matchAll(/^    name: '([a-z_]+)',$/gm)].map((m) => m[1]);
@@ -516,4 +516,119 @@ test('connect_me redaction fails closed on an unexpected shape', () => {
   const out = redact('<html>gateway error</html>');
   assert.ok(!out.includes('gateway error'), 'unparseable responses must not be passed through verbatim');
   assert.match(out, /withheld/i);
+});
+
+
+// ── Tool gating: readOnlyHint, not a name list ───────────────────────────────
+const buildSelect = () => {
+  const legacy = SRC.match(/^const MCP_LEGACY_ALLOWLIST = new Set\(\[[^\]]*\]\);$/m)[0];
+  return build(`${legacy}\n${grab('selectMcpTools')}`, 'selectMcpTools');
+};
+
+test('read-only tools auto-register and connect_drop never does', () => {
+  const selectMcpTools = buildSelect();
+  // Shape mirrors a real tools/list from Connect MCP >= 0.5.8.
+  const { register, skipped, annotated } = selectMcpTools([
+    { name: 'connect_lookup', annotations: { readOnlyHint: true } },
+    { name: 'connect_get_chains', annotations: { readOnlyHint: true } },
+    { name: 'connect_scores_by_username', annotations: { readOnlyHint: true } },
+    { name: 'connect_drop_balance', annotations: { readOnlyHint: true } },
+    { name: 'connect_drop', annotations: { readOnlyHint: false, destructiveHint: true } },
+  ]);
+
+  assert.equal(annotated, true);
+  assert.deepEqual(skipped, ['connect_drop'], 'the money path must never be offered');
+  // A brand-new read-only tool arrives with no code change — the whole point.
+  assert.ok(register.map((t) => t.name).includes('connect_get_chains'));
+  assert.equal(register.length, 4);
+});
+
+test('an unannotated tool from an annotating server is withheld', () => {
+  const selectMcpTools = buildSelect();
+  // The failure that matters: a future spend tool whose name matches no
+  // pattern. Name-based gating lets it through; absence of readOnlyHint does not.
+  const { register, skipped } = selectMcpTools([
+    { name: 'connect_lookup', annotations: { readOnlyHint: true } },
+    { name: 'connect_execute' },
+    { name: 'connect_settle', annotations: {} },
+  ]);
+
+  assert.deepEqual(register.map((t) => t.name), ['connect_lookup']);
+  assert.deepEqual(skipped, ['connect_execute', 'connect_settle']);
+});
+
+test('a server with no annotations falls back to the legacy allowlist', () => {
+  const selectMcpTools = buildSelect();
+  // Connect MCP before annotations. We cannot tell a read from a spend, so we
+  // offer exactly what we always did rather than guessing from names.
+  const { register, skipped, annotated } = selectMcpTools([
+    { name: 'connect_lookup' },
+    { name: 'connect_me' },
+    { name: 'connect_drop' },
+    { name: 'connect_get_chains' },
+  ]);
+
+  assert.equal(annotated, false);
+  assert.deepEqual(register.map((t) => t.name), ['connect_lookup', 'connect_me']);
+  assert.ok(skipped.includes('connect_drop'));
+  assert.ok(skipped.includes('connect_get_chains'), 'unknown tools stay out until annotated');
+});
+
+test('selectMcpTools survives a malformed tools/list', () => {
+  const selectMcpTools = buildSelect();
+  assert.deepEqual(selectMcpTools(undefined).register, []);
+  assert.deepEqual(selectMcpTools([null, {}, { name: '' }]).register, []);
+});
+
+test('the drop recipient enum matches the platforms Connect resolves', () => {
+  // Drifted silently once already: connect_lookup accepted slack while the
+  // hand-written drop schema did not, so the model could resolve a Slack
+  // identity and then not be allowed to name it as a recipient.
+  const enumLine = SRC.match(/^      enum: \[([^\]]*)\],$/m)[1]
+    .split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean);
+
+  for (const platform of ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin', 'slack']) {
+    assert.ok(enumLine.includes(platform), `RECIPIENT_SCHEMA is missing ${platform}`);
+  }
+});
+
+test('a keyless call omits the api-key header entirely', async () => {
+  // A header the server cannot verify — including the literal "undefined" a
+  // missing value stringifies to — is a 401, so the public tools would fail for
+  // exactly the users who have no key. No header is not a bad header.
+  const seen = [];
+  const env = build(
+    ['const MCP_URL = "https://mcp.example/";', grab('mcpRpc')].join('\n'),
+    'mcpRpc',
+    { fetch: async (_url, init) => {
+        seen.push(init.headers);
+        return { ok: true, json: async () => ({ result: { tools: [] } }) };
+      },
+      AbortController, setTimeout, clearTimeout },
+  );
+
+  await env('tools/list', {}, null);
+  await env('tools/list', {}, 'real-key');
+
+  assert.equal('x-api-key' in seen[0], false, 'no key must mean no header');
+  assert.equal(seen[1]['x-api-key'], 'real-key');
+});
+
+test('only auth and quota failures are turned into user-facing advice', () => {
+  const mcpFailureReason = build(
+    [SRC.match(/^const MCP_AUTH_ERROR_RE = .*$/m)[0],
+     SRC.match(/^const MCP_QUOTA_ERROR_RE = .*$/m)[0],
+     grab('mcpFailureReason')].join('\n'),
+    'mcpFailureReason',
+  );
+
+  assert.equal(mcpFailureReason(new Error('MCP tools/call HTTP 401: no key')), 'auth');
+  assert.equal(mcpFailureReason(new Error('Unauthorized')), 'auth');
+  assert.equal(mcpFailureReason(new Error('MCP tools/call HTTP 429: slow down')), 'quota');
+  assert.equal(mcpFailureReason(new Error('rate limit exceeded')), 'quota');
+  // Anything else must keep throwing — swallowing a 500 as "get a key" would
+  // send the user chasing the wrong problem.
+  assert.equal(mcpFailureReason(new Error('MCP tools/call HTTP 500: upstream down')), null);
+  assert.equal(mcpFailureReason(new Error('The operation was aborted')), null);
+  assert.equal(mcpFailureReason(undefined), null);
 });
