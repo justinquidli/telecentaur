@@ -120,9 +120,12 @@ You are TeleCentaur, a Telegram bot that sends crypto tokens to people using Qui
 - If resolve_telegram_username finds nothing AND connect_lookup/quidli_drop confirms the username can't be resolved: do NOT just tell the user to wait around. Call create_pending_claim with the recipient's username and the drop details instead. This returns a one-tap claim link. If you're in a group chat, the tool automatically posts the link directly, tagging the recipient — just tell the requester it's done, no need to forward anything. If you're in a DM, the bot has no way to reach the recipient directly, so tell the requester to forward the link themselves. Either way, once the recipient taps it, their wallet resolves and the drop executes automatically — no further action needed from anyone after that tap. Always prefer offering this claim link over saying "ask them to connect" or "ask them to message me" — it's faster and requires only one tap from the recipient.
 - USDC on Base: chainId=8453, tokenContract=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913, 1 USDC = 1000000 amountInWeiPerRecipient (6 decimals).
 - connect_get_chains lists every chain Connect supports and which features work on each (drop is true only for Smart Send chains). Use it to answer "what chains do you support" accurately instead of guessing.
-- Drops and balance checks here stay on Base (8453). Every explorer link this bot produces is a basescan.org link, so a transfer on another chain would be reported with a link that does not resolve. If someone asks to send on a different chain, tell them plainly that this bot sends on Base — do not attempt it.
+- Base (8453) is the default. Use it unless the user names another chain. Smart Send also supports Ethereum (1), Optimism (10), Polygon (137), Arbitrum (42161), Avalanche (43114) and Solana (1399811149) — call connect_get_chains if you need to confirm what is currently available.
+- Omit tokenContract (or set it to null) to send a chain's native token. Pass an ERC-20 contract or an SPL mint to send a token. Never use the zero address.
+- Solana (chainId 1399811149): amounts are in lamports for native SOL (9 decimals). USDC on Solana is the SPL mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (6 decimals). Social recipients are paid at their solWalletAddress, never their ethWalletAddress. Sending native SOL to an empty wallet needs at least 890880 lamports or the transaction fails, and the sender pays roughly 2039280 lamports of rent per new SPL destination account — so an "insufficient funds" error on an SPL send is often missing SOL, not missing tokens.
+- Always check the balance on the chain you are about to send on before sending.
 - Never reuse a token contract address across chains. The USDC address on Base is not USDC anywhere else.
-- After success, always show the basescan URL: https://basescan.org/tx/<transferHash>
+- After success, show the explorer link the drop tool returns (explorerUrl). Do not construct one yourself — it differs per chain, and a link you invent will be stripped before the user sees it.
 - If create_pending_claim also fails (no Quidli key connected), tell the user exactly that — ask if they have the person's numeric Telegram ID, or offer to send via email/phone/Twitter/Farcaster instead if available, or have the person connect at https://connect.quid.li (the ONLY correct URL — never invent or guess a different domain).
 - Use EXACTLY one of "id" or "username" per recipient, never both.
 
@@ -191,7 +194,7 @@ If a tool call returns an error or empty result:
 3. Only report failure to the user after at least 2 attempts.
 
 ## Response format
-- Success: state what you did + basescan URL if applicable. One or two sentences max.
+- Success: state what you did + the explorer link if applicable. One or two sentences max.
 - Failure: state what you tried and what the user can do next. No raw JSON, no stack traces.
 - Never show internal error messages verbatim to the user.
 - Do NOT use Markdown formatting — Telegram renders plain text by default.
@@ -995,6 +998,24 @@ async function quidliFetch(path, options = {}, apiKey = QUIDLI_API_KEY) {
   return res;
 }
 
+// One place that knows how to turn a transferHash into an explorer link. Chains
+// absent from this map yield null and callers omit the link rather than printing
+// one that doesn't resolve — which is what confined this bot to Base before.
+const CHAIN_EXPLORERS = {
+  1: 'https://etherscan.io/tx/',
+  10: 'https://optimistic.etherscan.io/tx/',
+  137: 'https://polygonscan.com/tx/',
+  8453: 'https://basescan.org/tx/',
+  42161: 'https://arbiscan.io/tx/',
+  43114: 'https://snowtrace.io/tx/',
+  1399811149: 'https://solscan.io/tx/',
+};
+function explorerTxUrl(chainId, hash) {
+  if (!hash) return null;
+  const base = CHAIN_EXPLORERS[Number(chainId)];
+  return base ? `${base}${hash}` : null;
+}
+
 async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
   recipients = recipients.map(({ type, id, username }) => {
     if (id) return { type, id };
@@ -1007,7 +1028,9 @@ async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453,
     method: 'POST',
     body: JSON.stringify({ idempotencyKey, chainId, tokenContract, amountInWeiPerRecipient, recipients }),
   }, apiKey);
-  return res.json();
+  const body = await res.json();
+  // Attach the link here so no caller has to know which chain it was.
+  return { ...body, explorerUrl: explorerTxUrl(chainId, body?.transferHash) };
 }
 
 // ─── Tools ────────────────────────────────────────────────────────────────────
@@ -1194,7 +1217,7 @@ const tools = [
         tokenContract: { type: 'string', description: 'Token contract address. USDC on Base: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
         chainId: { type: 'number', description: 'Chain ID. Base = 8453 (default).' },
       },
-      required: ['recipients', 'amountInWeiPerRecipient', 'tokenContract'],
+      required: ['recipients', 'amountInWeiPerRecipient'],
     },
   },
   // NOTE: reputation scores are no longer defined here — they come from Connect's
@@ -1323,21 +1346,24 @@ const tools = [
   },
 ];
 
-// Tracks basescan URLs produced during a turn so they're always shown
-const _pendingBasescanUrls = [];
+// Tracks explorer URLs produced during a turn so they're always shown
+const _pendingExplorerUrls = [];
 
 // Some models (observed: Kimi K2.6 via OpenRouter) will occasionally narrate a
 // fake "transaction sent" message with an invented tx hash instead of actually
 // calling quidli_drop. Since this bot moves real money, never trust a model's
-// own claim of a basescan link — only ever show one that came from a real
+// own claim of an explorer link — only ever show one that came from a real
 // quidliDrop() result this turn. Anything else gets stripped and flagged.
-const BASESCAN_TX_RE = /https?:\/\/basescan\.org\/tx\/(0x[a-fA-F0-9]{64})/g;
+const EXPLORER_TX_RE = /https?:\/\/(?:optimistic\.etherscan\.io|etherscan\.io|polygonscan\.com|basescan\.org|arbiscan\.io|snowtrace\.io|solscan\.io)\/tx\/([A-Za-z0-9]+)/g;
 function sanitizeUnverifiedTxClaims(text, realUrls) {
-  const realHashes = new Set(
-    realUrls.map((u) => u.match(/0x[a-fA-F0-9]{64}/)?.[0]?.toLowerCase()).filter(Boolean)
-  );
-  return text.replace(BASESCAN_TX_RE, (fullMatch, hash) => {
-    if (realHashes.has(hash.toLowerCase())) return fullMatch;
+  // EVM hashes are case-insensitive hex. Solana signatures are case-SENSITIVE
+  // base58 — lowercasing one would never match, so compare exactly first and
+  // only fall back to a case-insensitive match for EVM-shaped hashes.
+  const real = new Set(realUrls.map((u) => u.split('/tx/')[1]).filter(Boolean));
+  const realLower = new Set([...real].map((h) => h.toLowerCase()));
+  return text.replace(EXPLORER_TX_RE, (fullMatch, hash) => {
+    const evmShaped = /^0x[a-fA-F0-9]{64}$/.test(hash);
+    if (real.has(hash) || (evmShaped && realLower.has(hash.toLowerCase()))) return fullMatch;
     console.warn(`[safety] stripped unverified/fabricated tx link from model output: ${fullMatch}`);
     return '⚠️ [unverified transaction link removed — no matching transfer was actually recorded, this may not have really happened]';
   });
@@ -1381,8 +1407,7 @@ async function runTool(name, input, { senderId, senderApiKey, currentChatId, isP
     }
     const result = await quidliDrop(input, keyToUse);
     if (result.transferHash) {
-      result.basescanUrl = `https://basescan.org/tx/${result.transferHash}`;
-      _pendingBasescanUrls.push(result.basescanUrl);
+      if (result.explorerUrl) _pendingExplorerUrls.push(result.explorerUrl);
     }
     console.log('[drop] result:', JSON.stringify(result, null, 2));
     return JSON.stringify(result, null, 2);
@@ -1553,7 +1578,7 @@ async function executeScheduledDrop(jobId) {
     const result = await quidliDrop(stored, keyToUse);
     const recipientCount = stored.recipients?.length ?? 1;
     const msg = `✅ Scheduled drop executed! Sent to ${recipientCount} recipient${recipientCount !== 1 ? 's' : ''}.` +
-      (result.transferHash ? `\nhttps://basescan.org/tx/${result.transferHash}` : '');
+      (result.explorerUrl ? `\n${result.explorerUrl}` : '');
     await tg.telegram.sendMessage(notifyChat, msg).catch(() => {});
   } catch (err) {
     console.error(`[scheduled-drop] ${jobId} failed:`, err.message);
@@ -1614,7 +1639,7 @@ async function executeConditionalDrop(jobId) {
     const recipientCount = dropParams.recipients?.length ?? 1;
     await tg.telegram.sendMessage(notifyChat,
       `✅ Condition met: "${condition}"\nDrop executed to ${recipientCount} recipient${recipientCount !== 1 ? 's' : ''}.` +
-      (result.transferHash ? `\nhttps://basescan.org/tx/${result.transferHash}` : '')
+      (result.explorerUrl ? `\n${result.explorerUrl}` : '')
     ).catch(() => {});
   } catch (err) {
     console.error(`[conditional-drop] ${jobId} failed:`, err.message);
@@ -1690,7 +1715,7 @@ async function executeClaimedDrop(claimId, claimerTelegramId, claimerUsername) {
     const notifyChat = claim.chat_id ?? claim.sender_id;
     if (result.transferHash) {
       await tg.telegram.sendMessage(notifyChat,
-        `✅ @${claim.recipient_username} claimed their tokens!\nhttps://basescan.org/tx/${result.transferHash}`
+        `✅ @${claim.recipient_username} claimed their tokens!${result.explorerUrl ? `\n${result.explorerUrl}` : ''}`
       ).catch(() => {});
     }
     return { ok: true, result };
@@ -2116,7 +2141,7 @@ async function checkWatchers(chatId, senderId, username, text) {
       };
       const result = await quidliDrop(dropInput, keyToUse);
       if (result.transferHash) {
-        const url = `https://basescan.org/tx/${result.transferHash}`;
+        const url = result.explorerUrl;
         await tg.telegram.sendMessage(chatId, `🎉 @${username ?? senderId} triggered the drop by typing "${watcher.trigger_phrase}"!\nTransaction: ${url}`).catch(() => {});
         await tg.telegram.sendMessage(watcher.sender_id, `✅ Watcher triggered! ${username ?? senderId} typed "${watcher.trigger_phrase}".\nTransaction: ${url}`).catch(() => {});
       }
@@ -2506,7 +2531,7 @@ tg.start(async (ctx) => {
   const outcome = await executeClaimedDrop(claimId, ctx.from.id, ctx.from.username);
   if (outcome.ok) {
     const finalText = outcome.result.transferHash
-      ? `🎉 You've claimed your tokens!\nhttps://basescan.org/tx/${outcome.result.transferHash}`
+      ? `🎉 You've claimed your tokens!${outcome.result.explorerUrl ? `\n${outcome.result.explorerUrl}` : ''}`
       : "🎉 You've claimed your tokens!";
     await ctx.reply(finalText);
   } else {
@@ -2795,7 +2820,7 @@ tg.on(messageFilter('text'), async (ctx) => {
   let accumulated = '';
   let modelLabel = CLAUDE_MODEL;
 
-  _pendingBasescanUrls.length = 0;
+  _pendingExplorerUrls.length = 0;
 
   try {
     // The chat's switched provider decides what runs. Each user's messages use
@@ -2969,11 +2994,11 @@ tg.on(messageFilter('text'), async (ctx) => {
     }
 
     let finalText = accumulated || '(no response)';
-    finalText = sanitizeUnverifiedTxClaims(finalText, _pendingBasescanUrls);
-    for (const url of _pendingBasescanUrls) {
+    finalText = sanitizeUnverifiedTxClaims(finalText, _pendingExplorerUrls);
+    for (const url of _pendingExplorerUrls) {
       if (!finalText.includes(url)) finalText += `\n🔗 ${url}`;
     }
-    _pendingBasescanUrls.length = 0;
+    _pendingExplorerUrls.length = 0;
 
     finalText += `\n— ${modelLabel}`;
     if (agent) recordDigest(contextId, `/${agentTag(agent, username, isPrivate)}`, accumulated);

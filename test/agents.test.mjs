@@ -632,3 +632,49 @@ test('only auth and quota failures are turned into user-facing advice', () => {
   assert.equal(mcpFailureReason(new Error('The operation was aborted')), null);
   assert.equal(mcpFailureReason(undefined), null);
 });
+
+// ── multi-chain explorer links ────────────────────────────────────────────────
+// The bot was confined to Base because every link it produced was a basescan
+// link, so a transfer on any other chain would be reported with a URL that does
+// not resolve. quidliDrop now attaches the right link for the chain it used.
+test('explorer links follow the chain the drop was sent on', () => {
+  const src = `${grabConst('const CHAIN_EXPLORERS = \\{')}; ${grab('explorerTxUrl')}; return explorerTxUrl;`;
+  const url = new Function(src)();
+
+  assert.equal(url(8453, '0xabc'), 'https://basescan.org/tx/0xabc');
+  assert.equal(url(1, '0xabc'), 'https://etherscan.io/tx/0xabc');
+  assert.equal(url(1399811149, '5xTr'), 'https://solscan.io/tx/5xTr');
+  assert.equal(url('8453', '0xabc'), 'https://basescan.org/tx/0xabc', 'chainId may arrive as a string');
+  assert.equal(url(999999, '0xabc'), null, 'unknown chains get no link rather than a wrong one');
+  assert.equal(url(8453, undefined), null, 'no hash, no link');
+});
+
+// A Solana signature is case-sensitive base58, not 0x-prefixed hex. The old
+// sanitiser matched only basescan + hex, so a real Solana link would have been
+// stripped as fabricated the moment Solana drops started working.
+test('the tx sanitiser accepts real Solana links and still strips invented ones', () => {
+  const reLine = SRC.match(/^const EXPLORER_TX_RE = .*$/m);
+  assert.ok(reLine, 'EXPLORER_TX_RE not found in bot.js');
+  const src = `${reLine[0]}; ${grab('sanitizeUnverifiedTxClaims')}; return sanitizeUnverifiedTxClaims;`;
+  const sanitize = new Function(src)();
+
+  const realSol = 'https://solscan.io/tx/4KmXsPqRt9vBnW2gYzLc';
+  const kept = sanitize(`sent it: ${realSol}`, [realSol]);
+  assert.ok(kept.includes(realSol), 'a real Solana link must survive');
+
+  const faked = sanitize('sent it: https://solscan.io/tx/9zzFAKEsignature11', [realSol]);
+  assert.ok(!faked.includes('9zzFAKEsignature11'), 'an invented Solana link must be stripped');
+  assert.match(faked, /unverified transaction link removed/);
+
+  // EVM hashes stay case-insensitive
+  const realEvm = `https://basescan.org/tx/0x${'a'.repeat(64)}`;
+  const upper = `https://basescan.org/tx/0x${'A'.repeat(64)}`;
+  assert.ok(sanitize(`done ${upper}`, [realEvm]).includes(upper), 'EVM hashes compare case-insensitively');
+});
+
+test('quidli_drop no longer requires tokenContract, so native sends are expressible', () => {
+  const m = SRC.match(/name: 'quidli_drop'[\s\S]*?required: \[([^\]]*)\]/);
+  assert.ok(m, 'could not find quidli_drop required list');
+  assert.ok(!m[1].includes('tokenContract'), 'tokenContract must be optional — native SOL and native ETH omit it');
+  assert.ok(m[1].includes('recipients') && m[1].includes('amountInWeiPerRecipient'));
+});
