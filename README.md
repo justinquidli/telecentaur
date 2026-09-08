@@ -5,6 +5,7 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 ## What it can do
 
 - **Send tokens** — drop USDC or other tokens to anyone by Telegram handle, email, Twitter, Farcaster, and more
+- **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche and Solana. Explorer links follow the chain
 - **Look up wallets** — resolve any social identity to an ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos)
 - **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails
@@ -25,8 +26,8 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 Telegram message → the chat's model, or a named agent you addressed as /name
                → Claude / Gemini / OpenAI / OpenRouter / Nous Portal / your Mind / your own endpoint
                → Quidli Connect, over two paths:
-                   • MCP  — lookup / scores / balance (discovered at runtime)
-                   • REST — drop / exposed / claims / scheduling
+                   • MCP  — lookup / exposed / scores / balance / profile (discovered at runtime)
+                   • REST — drop (the only hand-written Connect call left)
                → edit Telegram reply in real time
 ```
 
@@ -38,6 +39,7 @@ what's my balance on base?
 schedule a drop of 5 USDC to @alice in 2 hours
 if ETH hits $5000 today, send 0.5 USDC to @bob
 send 0.01 USDC to the first person who types "gm" here today
+send 0.5 USDC to @alice on Solana
 switch to gemini
 switch to claude
 switch to minds
@@ -116,10 +118,10 @@ pm2 save
 npm run check     # syntax check + tests
 ```
 
-29 tests. They cover agent name slugging, addressing, key resolution, switch precedence, the
+32 tests. They cover agent name slugging, addressing, key resolution, switch precedence, the
 Minds migration, the group ownership rules, `connect_me` redaction, and the MCP tool gate
 (read-only registration, fail-closed on unannotated tools, the legacy fallback, and the
-keyless header). Every case corresponds to a bug that shipped or nearly shipped. `bot.js` connects to Telegram on import,
+keyless header), per-chain explorer links and the fabricated-transaction-link guard. Every case corresponds to a bug that shipped or nearly shipped. `bot.js` connects to Telegram on import,
 so the tests extract the functions under test from its source rather than importing it —
 a stopgap until it's split into modules.
 
@@ -193,10 +195,20 @@ How it works:
 
 Point it elsewhere with `CONNECT_MCP_URL` (defaults to `https://mcp.connect.quid.li/`).
 
-Note on chains: `connect_get_chains` is offered so the model can answer chain questions from the
-server rather than guessing, but **drops stay on Base (8453)**. Every explorer link the bot builds
-is hardcoded to `basescan.org`, so a transfer on another chain would be reported with a link that
-does not resolve. Chain-aware explorer URLs are a prerequisite for chain selection on drops.
+Note on chains: drops are **multi-chain**. Base (8453) is the default and what the model uses
+unless the user names another, but Ethereum (1), Optimism (10), Polygon (137), Arbitrum (42161),
+Avalanche (43114) and Solana (1399811149) all work. `connect_get_chains` lets the model answer
+chain questions from the server rather than guessing.
+
+Explorer links follow the chain. `CHAIN_EXPLORERS` maps a chainId to its explorer and `quidliDrop()`
+attaches the right link to its own result, so no caller has to know which chain was used. A chain
+absent from that map yields no link rather than a wrong one — which is safer than the previous
+behaviour, where every link was hardcoded to `basescan.org`.
+
+Solana specifics the model is told about: amounts are lamports for native SOL (9 decimals), USDC is
+the SPL mint `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (6 decimals), social recipients are paid
+at their `solWalletAddress`, and a native send to an empty wallet needs at least 890880 lamports.
+Omit `tokenContract` (or set it null) to send a chain's native token.
 
 To see what the server currently offers and how it is annotated:
 
