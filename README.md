@@ -87,7 +87,7 @@ cp .env.example .env
 | `OPENAI_API_KEY` | — | From [platform.openai.com](https://platform.openai.com) |
 | `OPENAI_MODEL` | — | Defaults to `gpt-4o` |
 | `NOUS_API_KEY` | — | From [portal.nousresearch.com](https://portal.nousresearch.com) — one key, 200+ models |
-| `NOUS_MODEL` | — | Defaults to `tencent/hy3:free` (free tier, supports tool calling) |
+| `NOUS_MODEL` | — | Defaults to `poolside/laguna-s-2.1:free` (free tier, supports tool calling) |
 | `HOST_KEY_ALLOWED_USERS` | — | Handles/IDs allowed to spend the host's LLM keys. Empty = owner only |
 | `TELEGRAM_ALLOWED_USERS` | — | Comma-separated Telegram user IDs allowed to use the bot. Empty = everyone |
 | `BOT_WALLET_PRIVATE_KEY` | — | Private key of a funded wallet for x402 pay-per-request. Note: lookup, scores and balance now go over MCP, which authenticates by API key only — so x402 no longer covers them |
@@ -323,13 +323,13 @@ key. There's no host-level OpenRouter key: it's per-user only, so each person DM
 
 `switch to nous` (or `/nous`) routes through [Nous Portal](https://portal.nousresearch.com), an
 OpenAI-compatible gateway to 200+ models under one key. Set `NOUS_API_KEY` to give everyone the
-host default (`NOUS_MODEL`, defaults to `tencent/hy3:free` — free tier and supports tool calling).
+host default (`NOUS_MODEL`, defaults to `poolside/laguna-s-2.1:free` — free tier and supports tool calling).
 
 Users can bring their own key and choose any model by DMing the bot:
 
 ```
 /llm nous <your-nous-key> anthropic/claude-sonnet-4.6
-/llm nous <your-nous-key> tencent/hy3:free
+/llm nous <your-nous-key> poolside/laguna-s-2.1:free
 ```
 
 Model slugs are vendor-prefixed; free variants end in `:free`. Portal serves models from every
