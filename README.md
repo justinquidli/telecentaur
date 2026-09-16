@@ -449,3 +449,14 @@ see the banner printed by the dying process while the new one silently ran none 
 work belongs in the `onLaunch` callback (2nd argument to `launch()`). There's a test for this in
 `test/agents.test.mjs`; this bug silently disabled MCP discovery, pending-drop restore and
 pending-claim restore.
+
+
+## Bankr agent
+
+The bot can hand trading and market requests to [Bankr](https://bankr.bot) through the `bankr_agent` tool (Bankr Agent API, `bankr.js`).
+
+- Each user links their own key: DM `/bankr <key>` (create it at bankr.bot/api with Agent API on, Read Only off). `/bankr_remove` unlinks. Keys are stored encrypted like Quidli keys.
+- The owner can set `BANKR_API_KEY` in `.env` as a host key; only `BOT_OWNER_ID` uses it.
+- Paying people still goes through Quidli Connect by default — Bankr can only pay existing Bankr users.
+- `bankr_agent` is a money tool: held for confirm while a document is in context, capped at 8 calls per user per 10 min, and a job still running after 2 min is reported as "may still execute", never resubmitted.
+- Explorer links are shown only when Bankr's own response contained them.
