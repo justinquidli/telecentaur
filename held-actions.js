@@ -24,7 +24,7 @@ import { randomInt } from 'node:crypto';
 // sender's Bankr wallet — we can't tell a price check from a send by its args.
 // create_pending_claim is here because a claim executes a drop automatically
 // when the recipient taps the link — no further input from the sender.
-export const MONEY_TOOLS = new Set(['quidli_drop', 'schedule_drop', 'conditional_drop', 'create_watcher', 'create_pending_claim', 'bankr_agent']);
+export const MONEY_TOOLS = new Set(['quidli_drop', 'schedule_drop', 'conditional_drop', 'create_watcher', 'create_pending_claim', 'bankr_agent', 'bankr_swap_and_drop']);
 
 export const HOLD_TTL_MS = 10 * 60 * 1000;
 export const MAX_HELD_PER_USER = 5;
@@ -146,7 +146,11 @@ export function describeHeldAction({ code, tool, input }) {
       ' — resolved when it runs, so the count is not known yet'
     : null;
 
-  if (tool === 'bankr_agent') {
+  if (tool === 'bankr_swap_and_drop') {
+    lines.push(`Swap in Bankr, then send with Connect on ${input.chain ?? 'base'}:`);
+    lines.push(`Sell ${input.sellAmount} of ${input.sellToken} for ${input.buyToken}, move all of it to your Connect wallet, and split it evenly between ${recipients.length} recipient${recipients.length === 1 ? '' : 's'}`);
+    lines.push(`→ ${shownRecipients || '(none)'}`);
+  } else if (tool === 'bankr_agent') {
     lines.push(`Bankr agent request (runs against your Bankr wallet — it may trade or transfer):`);
     lines.push(`“${String(input.prompt ?? '').slice(0, 500)}”`);
   } else if (tool === 'quidli_drop') {
@@ -218,6 +222,7 @@ export function neutraliseBotRecords(text) {
 }
 
 function summarise({ tool, input }) {
+  if (tool === 'bankr_swap_and_drop') return `Bankr swap of ${input.sellAmount} ${input.sellToken} → ${input.buyToken} then Connect drop to ${Array.isArray(input.recipients) ? input.recipients.length : 0} recipients`;
   if (tool === 'bankr_agent') return `Bankr agent request “${String(input.prompt ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 150)}”`;
   const chainId = input.chainId ?? 8453;
   const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;
