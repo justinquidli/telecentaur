@@ -21,6 +21,14 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
 import { Telegraf } from 'telegraf';
 import { message as messageFilter } from 'telegraf/filters';
+import {
+  isPdfAttachment, fetchPdf, extractPdfText, hasNoTextLayer, formatDocumentBlock, historyHasDocument,
+  createDocumentTaint, PDF_MAX_BYTES,
+} from './documents.js';
+import {
+  MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmPayload,
+  formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
+} from './held-actions.js';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -508,7 +516,7 @@ function normalizeAgentName(raw) {
 // Commands the bot already owns — an agent named `minds` would shadow /minds.
 const RESERVED_AGENT_NAMES = new Set([
   'agent', 'agents', 'minds', 'minds_remove', 'llm', 'llm_remove',
-  'connect', 'revoke', 'start', 'help',
+  'connect', 'revoke', 'start', 'help', 'confirm', 'cancel',
 ]);
 
 // The host key for a provider, or null if the host hasn't configured one.
@@ -866,6 +874,11 @@ const anthropicHistories = new Map();
 const geminiHistories    = new Map();
 const openaiHistories    = new Map();
 const MAX_HISTORY = 40;
+// Held-transfer mode lasts this many turns after the latest upload in a chat.
+// History keeps MAX_HISTORY messages = MAX_HISTORY/2 turns, so this covers the
+// document aging out AND every reply written while it was visible. Keyed by
+// chat, not by agent thread: agents see each other's replies via the digest.
+const documentTaint = createDocumentTaint({ turns: MAX_HISTORY });
 
 // ── Shared chat digest ────────────────────────────────────────────────────────
 // Each agent keeps its own conversation, which is what makes them feel separate —
@@ -1356,6 +1369,13 @@ const tools = [
 // Tracks explorer URLs produced during a turn so they're always shown
 const _pendingExplorerUrls = [];
 
+// Transfers parked while a document is in context. See held-actions.js.
+const heldActions = createHeldActionStore();
+// Outcomes of /confirm and /cancel, delivered to the chat's next model turn.
+const heldOutcomeRecords = createRecordQueue();
+// Explorer links from real drops per chat, so a later turn can repeat them.
+const verifiedTxLinks = createVerifiedLinkStore();
+
 // Some models (observed: Kimi K2.6 via OpenRouter) will occasionally narrate a
 // fake "transaction sent" message with an invented tx hash instead of actually
 // calling quidli_drop. Since this bot moves real money, never trust a model's
@@ -1378,8 +1398,29 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
 
 // ─── Tool runner ──────────────────────────────────────────────────────────────
 
-async function runTool(name, input, { senderId, senderApiKey, currentChatId, isPrivateChat } = {}) {
+async function runTool(name, input, {
+  senderId, senderApiKey, currentChatId, isPrivateChat, contextId = null,
+  documentInContext = false, confirmed = false, heldNotices = null,
+} = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
+
+  // ── Held-transfer gate ───────────────────────────────────────────────────────
+  // With a document in context, money-committing calls are parked, not run.
+  // A sender with no usable key falls through: those branches refuse without
+  // moving anything, and holding a transfer that can't run helps nobody.
+  if (MONEY_TOOLS.has(name) && documentInContext && !confirmed) {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    if (senderApiKey || isOwner) {
+      const held = heldActions.hold({
+        tool: name, input, senderId: String(senderId), channelId: currentChatId,
+        contextId: contextId ?? String(currentChatId), isPrivateChat,
+      });
+      if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
+      console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
+      return heldToolResult(held.code);
+    }
+  }
 
   // Tools discovered from Connect's MCP. Called with the sender's own key, so
   // the per-user model is identical to the REST path — the owner falls back to
@@ -2530,7 +2571,9 @@ tg.start(async (ctx) => {
   if (!payload.startsWith('claim_')) {
     return ctx.reply(
       "I'm TeleCentaur, your crypto-sending assistant. Mention me in a group or DM me to send USDC, check wallets, and more.\n\n" +
-      'DM /connect <your-api-key> to link your own Quidli wallet — get a key at connect.quid.li'
+      'DM /connect <your-api-key> to link your own Quidli wallet — get a key at connect.quid.li\n\n' +
+      '📄 Send a PDF (with a caption, or mention me in a group) and I\'ll read it. While a document is in the chat, ' +
+      'any transfer I start waits for you to send /confirm <code>.'
     );
   }
 
@@ -2546,14 +2589,105 @@ tg.start(async (ctx) => {
   }
 });
 
-// ── Main message handler ──────────────────────────────────────────────────────
+// ── /confirm and /cancel — held transfers ────────────────────────────────────
+// Work in DMs and groups, no mention needed. Codes are bound to the user whose
+// request created them, so nobody else in a group can fire or cancel one.
 
-tg.on(messageFilter('text'), async (ctx) => {
+async function handleConfirmCommand(ctx, verb) {
+  const senderId = String(ctx.from.id);
+  const code = parseConfirmPayload(ctx.payload);
+  if (!code) {
+    const mine = heldActions.listFor(senderId);
+    await ctx.reply(mine.length
+      ? `Your transfers waiting for confirmation:\n\n${mine.map(describeHeldAction).join('\n\n')}`
+      : (String(ctx.payload ?? '').trim()
+        ? `Usage: /${verb} <6-character code>`
+        : 'You have no transfers waiting for confirmation.')).catch(() => {});
+    return;
+  }
+
+  const taken = heldActions.take(code, senderId);
+  if (taken.error) {
+    await ctx.reply(`⚠️ ${taken.error}`).catch(() => {});
+    return;
+  }
+  const { action } = taken;
+  if (verb === 'cancel') {
+    console.log(`[held] cancelled code=${action.code} sender=${senderId}`);
+    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'cancelled'));
+    await ctx.reply(`🗑️ Cancelled ${action.code} — nothing was sent.`).catch(() => {});
+    return;
+  }
+
+  console.log(`[held] confirmed code=${action.code} tool=${action.tool} sender=${senderId}`);
+  const pending = await ctx.reply(`⏳ Running ${action.code}…`).catch(() => null);
+  const say = (t) => (pending
+    ? ctx.telegram.editMessageText(pending.chat.id, pending.message_id, undefined, t)
+    : ctx.reply(t)).catch(() => {});
+  let raw;
+  try {
+    // Key is looked up now, not at hold time: a /revoke in between must stick.
+    raw = await runTool(action.tool, action.input, {
+      senderId,
+      senderApiKey: getUserApiKey(senderId),
+      currentChatId: action.channelId,
+      isPrivateChat: action.isPrivateChat,
+      contextId: action.contextId,
+      confirmed: true,
+    });
+  } catch (err) {
+    console.error(`[held] ${action.code} failed:`, err.message);
+    // A thrown drop may still have landed server-side (e.g. timeout after
+    // submit), so tell the model it is unknown rather than that nothing moved.
+    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'unknown', err.message));
+    await say(`❌ ${action.code} failed: ${err.message.slice(0, 300)}`);
+    return;
+  }
+  let result;
+  try { result = JSON.parse(raw); } catch { result = {}; }
+  // runTool records drop links for the in-flight LLM turn; this isn't one.
+  if (result.explorerUrl) {
+    const i = _pendingExplorerUrls.indexOf(result.explorerUrl);
+    if (i !== -1) _pendingExplorerUrls.splice(i, 1);
+  }
+
+  const succeeded = action.tool === 'quidli_drop' ? !!result.transferHash : (!!result.success && !result.error);
+  if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
+  heldOutcomeRecords.push(action.contextId, succeeded
+    ? formatOutcomeRecord(action, 'executed',
+      result.transferHash ? `tx ${result.transferHash}`
+        : result.jobId ? `job ${result.jobId}`
+        : result.watcherId ? `watcher ${result.watcherId}`
+        : result.claimLink ? `claim link ${result.claimLink}` : '',
+      result.explorerUrl)
+    : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? ''));
+
+  if (action.tool === 'quidli_drop') {
+    await say(result.transferHash
+      ? `✅ Sent (${action.code}).${result.explorerUrl ? `\n🔗 ${result.explorerUrl}` : `\nTransfer hash: ${result.transferHash}`}`
+      : `❌ ${action.code} did not go through: ${String(result.error ?? result.message ?? raw).slice(0, 300)}`);
+  } else if (succeeded) {
+    await say(`✅ ${action.code}: ${result.message ?? result.note ?? 'done'}`
+      + (result.jobId ? ` (job ${result.jobId})` : '')
+      + (result.watcherId ? ` (watcher ${result.watcherId})` : '')
+      + (result.claimLink && !String(result.message ?? '').includes(result.claimLink) ? `\n${result.claimLink}` : ''));
+  } else {
+    await say(`❌ ${action.code} did not go through: ${String(result.error ?? raw).slice(0, 300)}`);
+  }
+}
+
+tg.command('confirm', (ctx) => handleConfirmCommand(ctx, 'confirm').catch((err) => console.error('[held] unhandled:', err)));
+tg.command('cancel', (ctx) => handleConfirmCommand(ctx, 'cancel').catch((err) => console.error('[held] unhandled:', err)));
+
+// ── Main message handler ──────────────────────────────────────────────────────
+// Handles plain text and documents (PDFs, with the caption as the message).
+
+async function handleChatMessage(ctx) {
   const msg = ctx.message;
   const senderId = String(msg.from.id);
   const chatId = msg.chat.id;
   const chatType = msg.chat.type;
-  const text = msg.text ?? '';
+  const text = msg.text ?? msg.caption ?? '';
   const username = msg.from.username ?? msg.from.first_name ?? senderId;
 
   // In groups: only respond when mentioned or replied to
@@ -2608,10 +2742,30 @@ tg.on(messageFilter('text'), async (ctx) => {
     ? text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim()
     : text.trim();
 
-  if (!cleanText) {
+  // A PDF on this message, or — if none — on the message it replies to, so
+  // "@bot summarise this" as a reply to someone's upload works. Telegram sends
+  // one document per message, so there's at most one.
+  let pdfDoc = null;
+  let pdfFrom = msg.from;
+  if (msg.document && isPdfAttachment({ contentType: msg.document.mime_type, name: msg.document.file_name })) {
+    pdfDoc = msg.document;
+  } else if (msg.document) {
+    // A non-PDF file with a mention: say so, rather than answering as if it weren't there.
+    await ctx.reply('📄 I can only read PDF files for now.').catch(() => {});
+    return;
+  } else {
+    const rd = msg.reply_to_message?.document;
+    if (rd && isPdfAttachment({ contentType: rd.mime_type, name: rd.file_name })) {
+      pdfDoc = rd;
+      pdfFrom = msg.reply_to_message.from ?? msg.from;
+    }
+  }
+
+  if (!cleanText && !pdfDoc) {
     await ctx.reply('What can I help you with?').catch(() => {});
     return;
   }
+  const DEFAULT_PDF_PROMPT = 'Summarise the attached document and tell me what, if anything, it asks me to do.';
 
   const contextId = String(chatId);
 
@@ -2650,6 +2804,7 @@ tg.on(messageFilter('text'), async (ctx) => {
         ).catch(() => {});
       }
       agentText = (m[2] ?? '').trim();
+      if (!agentText && pdfDoc) agentText = DEFAULT_PDF_PROMPT;
       if (!agentText) {
         // Naming an agent with nothing to say shows its card instead of burning a turn.
         await ctx.reply(
@@ -2661,7 +2816,7 @@ tg.on(messageFilter('text'), async (ctx) => {
       }
       // Replying to a message while addressing an agent hands it the quote, so
       // you can pass one agent's answer to another without copy-pasting.
-      const quoted = msg.reply_to_message?.text;
+      const quoted = msg.reply_to_message?.text ?? msg.reply_to_message?.caption;
       if (quoted) agentText = `[quoting an earlier message]\n${quoted}\n\n${agentText}`;
     }
     // No explicit /name: fall back to the chat's default agent if one is set.
@@ -2787,8 +2942,16 @@ tg.on(messageFilter('text'), async (ctx) => {
 
   const provider = getChannelProvider(contextId);
 
+  // Minds is a text relay to a separate runtime — it gets no tools and no
+  // history here, so there's nowhere safe to put a document.
+  if (pdfDoc && (agent ? agent.kind === 'minds' : provider === 'minds')) {
+    await ctx.reply('📄 PDFs aren\'t supported for Minds agents yet. Address an LLM agent, or say "switch to claude", and send it again.').catch(() => {});
+    return;
+  }
+  if (!agentText && pdfDoc) agentText = DEFAULT_PDF_PROMPT; // bare upload, no agent addressed
+
   // Send placeholder then edit it as response comes in
-  const pendingMsg = await ctx.reply(agent ? `${agent.agent_name} is thinking…` : 'Thinking…').catch((err) => {
+  const pendingMsg = await ctx.reply(pdfDoc ? 'Reading document…' : agent ? `${agent.agent_name} is thinking…` : 'Thinking…').catch((err) => {
     console.error('[tg] reply failed:', err.message);
     return null;
   });
@@ -2813,15 +2976,60 @@ tg.on(messageFilter('text'), async (ctx) => {
   recordDigest(contextId, agent ? `${speaker} → /${agent.agent_name}` : speaker, agentText);
   const digest = agent ? buildDigest(contextId) : '';
 
-  const contextualText = `${timeContext}\n${senderContext} ${walletNote}\n`
-    + (digest ? `${digest}\n\n` : '')
-    + agentText;
+  // ── Document ─────────────────────────────────────────────────────────────────
+  let docBlock = '';
+  if (pdfDoc) {
+    const name = pdfDoc.file_name || 'document.pdf';
+    try {
+      // Check size before getFileLink: the Bot API refuses files over 20 MB.
+      if (pdfDoc.file_size && pdfDoc.file_size > PDF_MAX_BYTES) {
+        throw new Error(`${name} is ${(pdfDoc.file_size / 1048576).toFixed(1)} MB — the limit is ${PDF_MAX_BYTES / 1048576} MB.`);
+      }
+      // The link embeds the bot token. It's passed to fetch and never logged.
+      const link = await ctx.telegram.getFileLink(pdfDoc.file_id);
+      const bytes = await fetchPdf({ name, contentType: pdfDoc.mime_type, size: pdfDoc.file_size, url: link.href });
+      const doc = await extractPdfText(bytes);
+      if (hasNoTextLayer(doc.text)) {
+        await editor.finalize(`📄 ${name} has no readable text — it looks like a scan or an image-only PDF. Send a text-based PDF, or paste the relevant part.`);
+        return;
+      }
+      const uploader = pdfFrom.username ?? pdfFrom.first_name ?? String(pdfFrom.id);
+      docBlock = formatDocumentBlock({ name, uploaderName: uploader, uploaderId: String(pdfFrom.id), ...doc });
+      console.log(`[pdf] pages=${doc.pagesRead}/${doc.totalPages} chars=${doc.text.length} truncated=${doc.truncated} ctx=${contextId}${agent ? `::${agent.agent_name}` : ''}`);
+    } catch (err) {
+      // err.message is ours or Telegram's description — neither includes the file URL.
+      console.error('[pdf] failed:', err.message);
+      await editor.finalize(`📄 ${err.message}`);
+      return;
+    }
+  }
+
+  // Results of /confirm and /cancel since the last turn in this chat.
+  const outcomeRecords = heldOutcomeRecords.take(contextId);
+  const contextualText =
+    (outcomeRecords.length ? `${outcomeRecords.join('\n')}\n` : '')
+    + `${timeContext}\n${senderContext} ${walletNote}\n`
+    + (digest ? `${neutraliseBotRecords(digest)}\n\n` : '')
+    + neutraliseBotRecords(agentText)
+    + (docBlock ? `\n\n${docBlock}` : '');
+
+  // The gate is per chat, not per uploader or agent: a PDF anyone posted here
+  // can steer this turn, directly or through an agent reply in the digest.
+  if (docBlock) documentTaint.mark(contextId);
+  const historyKey = agent ? agentContextId(contextId, agent.agent_name) : contextId;
+  const documentInContext = documentTaint.isTainted(contextId) || historyHasDocument(
+    anthropicHistories.get(historyKey), geminiHistories.get(historyKey), openaiHistories.get(historyKey),
+  );
+  const heldNotices = [];
 
   const toolCtx = {
     senderId,
     senderApiKey,
     currentChatId: chatId,
     isPrivateChat: isPrivate,
+    contextId,
+    documentInContext,
+    heldNotices,
   };
 
   let accumulated = '';
@@ -3001,15 +3209,21 @@ tg.on(messageFilter('text'), async (ctx) => {
     }
 
     let finalText = accumulated || '(no response)';
-    finalText = sanitizeUnverifiedTxClaims(finalText, _pendingExplorerUrls);
+    finalText = sanitizeUnverifiedTxClaims(finalText, [..._pendingExplorerUrls, ...verifiedTxLinks.list(contextId)]);
+    for (const url of _pendingExplorerUrls) verifiedTxLinks.add(contextId, url);
     for (const url of _pendingExplorerUrls) {
       if (!finalText.includes(url)) finalText += `\n🔗 ${url}`;
     }
     _pendingExplorerUrls.length = 0;
 
+    // Built from the held arguments, not the model's prose — this is what runs.
+    for (const notice of heldNotices) finalText += `\n\n${notice}`;
+    if (documentInContext && heldNotices.length === 0) finalText += '\n📄 document in context — transfers need /confirm';
+
     finalText += `\n— ${modelLabel}`;
     if (agent) recordDigest(contextId, `/${agentTag(agent, username, isPrivate)}`, accumulated);
     await editor.finalize(finalText);
+    documentTaint.tick(contextId);
 
   } catch (err) {
     console.error(`[${agent ? `agent:${agent.agent_name}` : provider}] error:`, err);
@@ -3026,7 +3240,10 @@ tg.on(messageFilter('text'), async (ctx) => {
 
   // Also check watchers (in case bot message triggered one)
   await checkWatchers(chatId, senderId, username, cleanText).catch(() => {});
-});
+}
+
+tg.on(messageFilter('text'), handleChatMessage);
+tg.on(messageFilter('document'), handleChatMessage);
 
 // ─── Launch ───────────────────────────────────────────────────────────────────
 

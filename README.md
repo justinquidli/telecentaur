@@ -385,6 +385,30 @@ list my watchers
 cancel watcher <id>
 ```
 
+## PDF attachments
+
+Send a PDF — in a DM, or in a group with a caption that mentions the bot (or reply to someone's PDF and mention the bot) — and it reads the document and acts on what you ask. No caption means "summarise this and tell me what it asks me to do". Works with named agents (`/tim` as the caption) and every provider except Minds.
+
+- 20 MB (the Bot API download limit), first 50 pages, ~48k characters; the bot says when it truncated.
+- Text extraction only (`unpdf`). Scanned / image-only and password-protected PDFs are refused with a message. Non-PDF files are declined.
+- The text goes into the conversation history (the chat's, or the addressed agent's thread), so follow-ups work until it ages out.
+
+**Transfers are held while a document is in the chat.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So for 40 turns after anyone uploads one to a chat — long enough for the document, and every reply or agent digest that quoted it, to leave the history — `quidli_drop`, `schedule_drop`, `conditional_drop`, `create_watcher` and `create_pending_claim` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
+
+```
+/confirm K7QM2P   — run it
+/cancel K7QM2P    — drop it
+/confirm          — list your held transfers
+```
+
+- Only the person whose request created the transfer can confirm or cancel it — not the uploader, not anyone else in the group. It runs on the requester's wallet.
+- Codes are one-shot, expire after 10 minutes, and live in memory; a restart clears them, along with the chat history and the 40-turn window. Don't redeploy mid-demo.
+- The outcome of each `/confirm` / `/cancel` (sent, failed, unknown, cancelled), with the verified explorer link, goes to the model on the chat's next turn, so "did that go through?" gets a real answer instead of a second send — and the real link isn't stripped by the fabricated-link filter.
+- No duplicate detection: re-uploading the same invoice (renamed or not) produces a new held transfer. The human confirmation is the only guard.
+- `confirm` and `cancel` are now reserved and can't be used as agent names. An agent created with either name before this change becomes unreachable — rename it with `/agent rename`.
+
+Enforced in `runTool`, not the prompt. Logic in `documents.js` and `held-actions.js`; tests in `test/pdf.test.mjs`, including one that fails if a money-moving tool is added without being gated.
+
 ## Tool-loop safety
 
 Every user message is capped at **25 tool round-trips** (`MAX_TOOL_ROUNDS`) across all
