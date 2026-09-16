@@ -26,7 +26,7 @@ import {
   createDocumentTaint, PDF_MAX_BYTES,
 } from './documents.js';
 import {
-  MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmPayload,
+  MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmPayload, parseInlineConfirm,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 
@@ -2593,16 +2593,17 @@ tg.start(async (ctx) => {
 // Work in DMs and groups, no mention needed. Codes are bound to the user whose
 // request created them, so nobody else in a group can fire or cancel one.
 
-async function handleConfirmCommand(ctx, verb) {
+async function handleConfirmCommand(ctx, verb, payload = ctx.payload) {
   const senderId = String(ctx.from.id);
-  const code = parseConfirmPayload(ctx.payload);
+  const code = parseConfirmPayload(payload);
   if (!code) {
     const mine = heldActions.listFor(senderId);
     await ctx.reply(mine.length
       ? `Your transfers waiting for confirmation:\n\n${mine.map(describeHeldAction).join('\n\n')}`
-      : (String(ctx.payload ?? '').trim()
+      : (String(payload ?? '').trim()
         ? `Usage: /${verb} <6-character code>`
-        : 'You have no transfers waiting for confirmation.')).catch(() => {});
+        : 'Nothing is waiting for your confirmation. Ask me to pay or send something — while a document is in the chat, '
+          + 'I\'ll post a code for you to /confirm.')).catch(() => {});
     return;
   }
 
@@ -2741,6 +2742,14 @@ async function handleChatMessage(ctx) {
   const cleanText = botUsername
     ? text.replace(new RegExp(`@${botUsername}`, 'gi'), '').trim()
     : text.trim();
+
+  // "@bot /confirm CODE" — not a Telegram command (the mention comes first), so
+  // handle it here rather than letting the model interpret it.
+  const inlineConfirm = parseInlineConfirm(cleanText);
+  if (inlineConfirm) {
+    await handleConfirmCommand(ctx, inlineConfirm.verb, inlineConfirm.payload);
+    return;
+  }
 
   // A PDF on this message, or — if none — on the message it replies to, so
   // "@bot summarise this" as a reply to someone's upload works. Telegram sends

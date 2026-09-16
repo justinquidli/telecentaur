@@ -342,3 +342,46 @@ test('handler wiring', () => {
   // Window must cover a full history turnover twice (document + replies that saw it).
   assert.match(SRC, /createDocumentTaint\(\{ turns: MAX_HISTORY \}\)/);
 });
+
+// ─── confirm UX ──────────────────────────────────────────────────────────────
+
+import { parseInlineConfirm } from '../held-actions.js';
+
+test('email and phone recipients show the address, not "id"', () => {
+  const email = describeHeldAction({ code: 'ABC234', tool: 'quidli_drop', input: { ...drop, recipients: [{ type: 'email', id: 'arnaud@girosense.com' }] } });
+  assert.match(email, /→ email arnaud@girosense\.com/);
+  assert.doesNotMatch(email, /email id/);
+  const phone = describeHeldAction({ code: 'ABC234', tool: 'quidli_drop', input: { ...drop, recipients: [{ type: 'phone', username: '+33600000000' }] } });
+  assert.match(phone, /→ phone \+33600000000/);
+  const gh = describeHeldAction({ code: 'ABC234', tool: 'quidli_drop', input: { ...drop, recipients: [{ type: 'github', username: 'x' }] } });
+  assert.match(gh, /→ github @x/);
+});
+
+test('parseInlineConfirm catches "/confirm CODE" after a mention, nothing else', () => {
+  assert.deepEqual(parseInlineConfirm('/confirm 7zs7mh'), { verb: 'confirm', payload: '7zs7mh' });
+  assert.deepEqual(parseInlineConfirm('  /cancel@TeleCentaurBot 7ZS7MH '), { verb: 'cancel', payload: '7ZS7MH' });
+  assert.deepEqual(parseInlineConfirm('/confirm'), { verb: 'confirm', payload: '' });
+  assert.equal(parseInlineConfirm('/confirm 7ZS7MH and pay the next one too'), null);
+  assert.equal(parseInlineConfirm('please /confirm 7ZS7MH'), null);
+  assert.equal(parseInlineConfirm('/confirmed'), null);
+  assert.equal(parseInlineConfirm('/tim confirm this'), null);
+});
+
+test('"@bot /confirm CODE" goes to the confirm handler before any model or agent routing', () => {
+  const h = fnSrc('handleChatMessage');
+  const at = h.indexOf('parseInlineConfirm(cleanText)');
+  assert.ok(at > 0, 'inline confirm is checked');
+  assert.ok(at < h.indexOf('let agent = null'), 'before agent addressing');
+  assert.ok(at < h.indexOf('runAnthropicLoop'), 'before any model call');
+  assert.match(h, /await handleConfirmCommand\(ctx, inlineConfirm\.verb, inlineConfirm\.payload\);\n\s*return;/);
+});
+
+test('inline payload is used, and bare /confirm with nothing held explains how to get a code', async () => {
+  const ran = [];
+  const { fn, deps, ctx, replies } = buildConfirm(async () => { ran.push(1); return JSON.stringify({ transferHash: '0x1', explorerUrl: REAL }); });
+  await fn(ctx(''), 'confirm');
+  assert.match(replies.at(-1), /Nothing is waiting.*\/confirm/);
+  const { code } = deps.heldActions.hold({ tool: 'quidli_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
+  await fn(ctx(undefined), 'confirm', code); // ctx.payload absent, as in the text handler
+  assert.equal(ran.length, 1);
+});
