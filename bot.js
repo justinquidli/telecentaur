@@ -30,6 +30,7 @@ import {
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
+import { resolveRecipientsToWallets } from './recipients.js';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -1077,12 +1078,13 @@ function explorerTxUrl(chainId, hash) {
 }
 
 async function quidliDrop({ recipients, amountInWeiPerRecipient, chainId = 8453, tokenContract }, apiKey = QUIDLI_API_KEY) {
-  recipients = recipients.map(({ type, id, username }) => {
-    if (id) return { type, id };
-    if (username) return { type, username };
-    return { type };
-  });
   if (!apiKey) throw new Error('No Quidli API key available. DM me /connect <your-api-key> to link your account.');
+  // Connect's /drop rejects social recipients today, so resolve them to wallets
+  // first. All-or-nothing — see recipients.js.
+  const resolved = await resolveRecipientsToWallets(recipients,
+    async (social) => JSON.parse(await mcpCallTool('connect_lookup', { recipients: social }, apiKey)));
+  if (resolved.error) return { error: resolved.error, failedRecipients: resolved.failed };
+  recipients = resolved.recipients;
   const idempotencyKey = crypto.randomUUID();
   const res = await quidliFetch('/drop', {
     method: 'POST',
@@ -1100,8 +1102,8 @@ const RECIPIENT_SCHEMA = {
   properties: {
     type: {
       type: 'string',
-      enum: ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin', 'slack'],
-      description: 'The social platform type',
+      enum: ['discord', 'email', 'phone', 'twitter', 'telegram', 'farcaster', 'github', 'linkedin', 'slack', 'wallet'],
+      description: 'The social platform type, or "wallet" with id set to an EVM address',
     },
     id: { type: 'string', description: 'Numeric user ID on that platform. Use EITHER id OR username, never both.' },
     username: { type: 'string', description: 'Handle/username. Use EITHER id OR username, never both.' },
@@ -1542,6 +1544,8 @@ async function runTool(name, input, {
     const result = await bankrSwapAndDrop(input, {
       bankrKey,
       getConnectBalance: async (chainId) => JSON.parse(await mcpCallTool('connect_drop_balance', { chainId }, quidliKey)),
+      resolveRecipients: (list) => resolveRecipientsToWallets(list,
+        async (social) => JSON.parse(await mcpCallTool('connect_lookup', { recipients: social }, quidliKey))),
       drop: (args) => quidliDrop(args, quidliKey),
       explorerUrl: explorerTxUrl,
     });
