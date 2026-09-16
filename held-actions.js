@@ -114,8 +114,13 @@ export function formatAmount(amountInWei, tokenContract, chainId = 8453) {
 }
 
 // Plain text: TeleCentaur sends messages without parse_mode.
+// Email and phone identifiers are the address itself — "email arnaud@x.com",
+// not "email id arnaud@x.com".
+const ADDRESS_TYPES = new Set(['email', 'phone']);
+
 function describeRecipient(r) {
   if (!r || typeof r !== 'object') return '(invalid recipient)';
+  if (ADDRESS_TYPES.has(r.type) && (r.id || r.username)) return `${r.type} ${r.id ?? r.username}`;
   const who = r.username ? `@${String(r.username).replace(/^@/, '')}` : r.id ? `id ${r.id}` : '(no id)';
   return r.type === 'telegram' ? who : `${r.type ?? '?'} ${who}`;
 }
@@ -176,6 +181,17 @@ export function heldToolResult(code) {
       'The bot has already posted the details and the confirm command beneath your reply — do not repeat the code ' +
       'and do not say the transfer happened. Briefly tell the user it is waiting for their confirmation.',
   });
+}
+
+/**
+ * "/confirm ABC234" typed after a mention ("@bot /confirm ABC234") isn't a
+ * Telegram command — commands must start the message — so the text handler
+ * checks for it with this, on the mention-stripped text.
+ * Returns { verb, payload } or null.
+ */
+export function parseInlineConfirm(text) {
+  const m = String(text ?? '').trim().match(/^\/(confirm|cancel)(?:@\w+)?(?:\s+(\S*))?\s*$/i);
+  return m ? { verb: m[1].toLowerCase(), payload: m[2] ?? '' } : null;
 }
 
 /** `/confirm ABC234` payload (ctx.payload) → code, or null for a bare /confirm. */
