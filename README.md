@@ -5,6 +5,7 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 ## What it can do
 
 - **Send tokens** — drop USDC or other tokens to anyone by Telegram handle, email, Twitter, Farcaster, and more
+- **Pay invoices from a PDF** — send the bot an invoice; it reads it and prepares the payment to the vendor's email or social handle, held until you `/confirm` ([details](#pdf-attachments))
 - **Multi-chain** — Base by default, plus Ethereum, Optimism, Polygon, Arbitrum, Avalanche and Solana. Explorer links follow the chain
 - **Look up wallets** — resolve any social identity to an ETH/SOL wallet address
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos)
