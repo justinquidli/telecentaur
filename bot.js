@@ -191,6 +191,7 @@ When the user wants to swap or buy a token and send the result to people ("swap 
 - Report the message field. status partial or unknown means some steps ran: say exactly where the funds are and do NOT call the tool again for the same request.
 
 ## Bankr (bankr_agent)
+- Key commands (/bankr) are handled by the bot directly and are never shown to you, so you can't see whether a key was sent. Never ask anyone to paste a key into the conversation. If the user says they linked it, just call the Bankr tool — its result says whether a key is linked. A bare /bankr in DM shows the user their link status.
 Bankr is a separate crypto agent with its own wallet per user. Use bankr_agent for trading and market actions: token prices and research, swaps/buys/sells, and the user's Bankr wallet balance. It needs the user's own Bankr key (DM /bankr <key>); if it says none is linked, tell them how.
 - Quidli Connect (quidli_drop) and Bankr are separate wallets. "My balance" means Connect unless the user says Bankr.
 - For PAYING people, prefer quidli_drop: Connect reaches anyone (email, Discord, GitHub, Telegram, X, Farcaster) and creates a wallet if needed. Bankr can only pay recipients who already have a Bankr account and fails otherwise. Use Bankr for a transfer only when the user asks for Bankr explicitly or gives a wallet address and wants it sent from their Bankr wallet.
@@ -2691,11 +2692,14 @@ tg.command('bankr', async (ctx) => {
     const scrubbed = ctx.message.text.trim().split(/\s+/).length > 1 ? await scrubCredentialMessage(ctx) : false;
     return ctx.reply('DM me /bankr <key> — never post a Bankr key in a group.' + (scrubbed ? ' (Deleted your message.)' : ''));
   }
-  const apiKey = ctx.message.text.replace(/^\/bankr(@\w+)?/, '').trim();
+  const apiKey = ctx.message.text.replace(/^\/bankr(@\w+)?[\s:=]*/, '').trim().split(/\s+/)[0] ?? '';
   if (!apiKey) {
-    return ctx.reply('Usage: /bankr <your-bankr-api-key>\nCreate one at https://bankr.bot/api with Agent API enabled and Read Only off.');
+    const linked = !!getUserBankrKey(ctx.from.id);
+    return ctx.reply((linked ? '✅ Your Bankr key is linked.' : 'No Bankr key linked yet.')
+      + '\nTo set or replace it: /bankr <your-bankr-api-key>\nCreate one at https://bankr.bot/api — Agent API and Wallet API on, Read Only off.');
   }
   setUserBankrKey(ctx.from.id, apiKey);
+  console.log(`[bankr] key linked for ${ctx.from.id}`);
   const scrubbed = await scrubCredentialMessage(ctx);
   ctx.reply(
     '✅ Bankr linked. I can now trade and check balances on your Bankr wallet when you ask.\n\n' +
