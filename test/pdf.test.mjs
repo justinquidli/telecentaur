@@ -176,6 +176,7 @@ function buildRunTool() {
     MONEY_TOOLS, heldActions: createHeldActionStore(), describeHeldAction, heldToolResult,
     mcpToolNames: new Set(),
     MCP_CONFIRM_TOOLS,
+    shutdown: { stopping: false, track: (p) => p },
     mcpCallTool: async (name, input, key) => { calls.push({ tool: name, key }); return '{"ok":true}'; },
     redactConnectMe: (t) => t,
     _pendingExplorerUrls: [],
@@ -252,6 +253,7 @@ function buildConfirm(runToolImpl) {
     getUserApiKey: () => 'k',
     _pendingExplorerUrls: [],
     runTool: runToolImpl,
+    trackedRunTool: runToolImpl,
   };
   const fn = new Function(...Object.keys(deps), `${fnSrc('handleConfirmCommand')}\nreturn handleConfirmCommand;`)(...Object.values(deps));
   const replies = [];
@@ -442,4 +444,27 @@ test('/confirm on a trust write reports the server result and records it', async
   await no.fn(no.ctx(b.code), 'confirm');
   assert.match(no.replies.at(-1), /did not go through: Error: this needs your own Quidli key/);
   assert.match(no.deps.heldOutcomeRecords.take('t')[0], /FAILED/);
+});
+
+test('while the bot is shutting down, new money and trust actions are refused, reads are not', async () => {
+  const { runTool, calls, deps } = buildRunTool();
+  deps.shutdown.stopping = true;
+  deps.mcpToolNames.add('connect_trust_create');
+  deps.mcpToolNames.add('connect_lookup');
+  for (const tool of ['quidli_drop', 'connect_trust_create']) {
+    const out = JSON.parse(await runTool(tool, tool === 'quidli_drop' ? drop : trustInput, { senderId: 'u1', senderApiKey: 'k', confirmed: true }));
+    assert.equal(out.status, 'refused');
+    assert.match(out.error, /restarting/);
+  }
+  await runTool('connect_lookup', {}, { senderId: 'u1', senderApiKey: 'k' });
+  assert.deepEqual(calls, [{ tool: 'connect_lookup', key: 'k' }]);
+});
+
+test('a handler error is caught by tg.catch, not left to stop polling', () => {
+  const catchAt = SRC.indexOf('tg.catch(');
+  const launchAt = SRC.indexOf('tg.launch(');
+  assert.ok(catchAt > 0, 'tg.catch is registered');
+  assert.ok(catchAt < launchAt, 'and registered before launch');
+  assert.ok(SRC.includes('shutdown.install()'), 'signals go through shutdown.js');
+  assert.ok(!/process\.once\('SIGINT', \(\) => tg\.stop/.test(SRC), 'old stop-only handler is gone');
 });
