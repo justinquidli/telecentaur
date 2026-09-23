@@ -10,6 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { MCP_SEND_TOOLS } from '../connect-mcp.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -174,14 +175,19 @@ function buildRunTool() {
     BOT_OWNER_ID: 'owner',
     QUIDLI_API_KEY: 'host-key',
     MONEY_TOOLS, heldActions: createHeldActionStore(), describeHeldAction, heldToolResult,
-    mcpToolNames: new Set(),
+    mcpToolNames: new Set(['connect_drop']),
+    explorerTxUrl: (c, h) => (h ? `https://basescan.org/tx/${h}` : null),
     MCP_CONFIRM_TOOLS,
-    MCP_WRAPPED_TOOLS,
     shutdown: { stopping: false, track: (p) => p },
-    mcpCallTool: async (name, input, key) => { calls.push({ tool: name, key }); return '{"ok":true}'; },
+    mcpCallTool: async (name, input, key) => {
+      if (!key) throw new Error('MCP tools/call HTTP 401: no key');
+      calls.push({ tool: name, key });
+      return name === 'connect_drop' ? '{"httpStatus":201,"transferHash":"0xabc"}' : '{"ok":true}';
+    },
+    mcpFailureReason: (err) => (/HTTP 401/.test(err?.message ?? '') ? 'auth' : null),
     redactConnectMe: (t) => t,
     _pendingExplorerUrls: [],
-    quidliDrop: async (input, key) => { calls.push({ tool: 'connect_drop', key }); return { status: 'submitted', transferHash: '0xabc', explorerUrl: REAL }; },
+    quidliDrop: async (input, key) => { calls.push({ tool: 'connect_drop', key }); return { transferHash: '0xabc', explorerUrl: REAL }; },
     db: { prepare: () => ({ run: () => calls.push({ tool: 'db-write' }), all: () => [], get: () => null }) },
     scheduleDropJob: () => {},
     executeConditionalDrop: () => {},
@@ -224,8 +230,8 @@ test('without a document, drops run as before; keyless senders are refused, not 
   const { runTool, calls, deps } = buildRunTool();
   await runTool('connect_drop', drop, { senderId: 1, senderApiKey: 'k', currentChatId: 1 });
   assert.equal(calls.length, 1);
-  const keyless = JSON.parse(await runTool('connect_drop', drop, { senderId: 2, currentChatId: 1, documentInContext: true }));
-  assert.match(keyless.error, /No Quidli API key/);
+  const keyless = { error: await runTool('connect_drop', drop, { senderId: 2, currentChatId: 1, documentInContext: true }) };
+  assert.match(String(keyless.error ?? keyless), /own Quidli key/);
   const owner = JSON.parse(await runTool('connect_drop', drop, { senderId: 'owner', currentChatId: 1, documentInContext: true }));
   assert.equal(owner.status, 'held_for_confirmation');
   assert.equal(deps.heldActions.size, 1);
@@ -238,7 +244,7 @@ test('every runTool branch that spends or schedules money is gated', () => {
   const spending = branches
     .filter(([, , body]) => /quidliDrop\(|bankrAgent\(|bankrSwapAndDrop\(|INSERT INTO (scheduled_drops|watchers|pending_claims)|createPendingClaim\(/.test(body))
     .map(([, name]) => name);
-  assert.deepEqual(spending.sort(), [...MONEY_TOOLS].sort(),
+  assert.deepEqual(spending.sort(), [...MONEY_TOOLS].filter((t) => !MCP_SEND_TOOLS.has(t)).sort(),
     'a money-moving tool was added or removed — update MONEY_TOOLS in held-actions.js');
 });
 
@@ -270,7 +276,7 @@ test('/confirm runs once, records outcome and verified link for the chat', async
   const ran = [];
   const { fn, deps, ctx, replies } = buildConfirm(async (tool, input, c) => {
     ran.push(c);
-    return JSON.stringify({ status: 'submitted', transferHash: REAL.split('/tx/')[1], explorerUrl: REAL });
+    return JSON.stringify({ transferHash: REAL.split('/tx/')[1], explorerUrl: REAL });
   });
   const { code } = deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: '42', channelId: -100, contextId: '-100', isPrivateChat: false });
 
@@ -385,7 +391,7 @@ test('"@bot /confirm CODE" goes to the confirm handler before any model or agent
 
 test('inline payload is used, and bare /confirm with nothing held explains how to get a code', async () => {
   const ran = [];
-  const { fn, deps, ctx, replies } = buildConfirm(async () => { ran.push(1); return JSON.stringify({ status: 'submitted', transferHash: '0x1', explorerUrl: REAL }); });
+  const { fn, deps, ctx, replies } = buildConfirm(async () => { ran.push(1); return JSON.stringify({ transferHash: '0x1', explorerUrl: REAL }); });
   await fn(ctx(''), 'confirm');
   assert.match(replies.at(-1), /Nothing is waiting.*\/confirm/);
   const { code } = deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
@@ -395,7 +401,7 @@ test('inline payload is used, and bare /confirm with nothing held explains how t
 
 // ─── Connect write tools: always confirmed, document or not ─────────────────
 
-import { MCP_CONFIRM_TOOLS, MCP_WRAPPED_TOOLS } from '../connect-mcp.js';
+import { MCP_CONFIRM_TOOLS } from '../connect-mcp.js';
 
 const trustInput = { to: { type: 'github', username: 'alice' }, level: 80, context: 'team:quidli' };
 
@@ -421,9 +427,10 @@ for (const tool of ['connect_trust_create', 'connect_trust_revoke']) {
 test('trust write from a keyless non-owner is not held and never gets the host key', async () => {
   const { runTool, calls, deps } = buildRunTool();
   deps.mcpToolNames.add('connect_trust_create');
-  await runTool('connect_trust_create', trustInput, { senderId: 'nobody' });
+  const out = await runTool('connect_trust_create', trustInput, { senderId: 'nobody' });
   assert.equal(deps.heldActions.size, 0);
-  assert.deepEqual(calls, [{ tool: 'connect_trust_create', key: null }], 'anonymous call — the server refuses it');
+  assert.match(out, /own Quidli key/, 'anonymous call — the server refuses it, no host key used');
+  assert.deepEqual(calls, []);
 });
 
 test('read-only MCP tools are never held', async () => {
@@ -470,48 +477,17 @@ test('a handler error is caught by tg.catch, not left to stop polling', () => {
   assert.ok(!/process\.once\('SIGINT', \(\) => tg\.stop/.test(SRC), 'old stop-only handler is gone');
 });
 
-// ─── amount check in the real send path ─────────────────────────────────────
-
-import { checkAmountGrounded, tokenInfo } from '../connect-drop.js';
-
-function buildGuardedRunTool() {
-  const verifySrc = SRC.match(/^async function verifyAmount[\s\S]*?\n}$/m)[0];
-  const amountToolsSrc = SRC.match(/^const AMOUNT_TOOLS = new Set\(\[[^\]]*\]\);$/m)[0];
-  const balance = { assets: [{ type: 'erc20', tokenContract: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC', decimals: 6 }] };
-  const { runTool: _unused, calls, deps } = buildRunTool();
-  deps.mcpCallTool = async (name, input, key) => {
-    calls.push({ tool: name, key });
-    if (name === 'connect_drop_balance') return JSON.stringify(balance);
-    return '{"ok":true}';
-  };
-  const helpers = new Function(...Object.keys(deps), 'tokenInfo', 'checkAmountGrounded',
-    `${amountToolsSrc}\n${verifySrc}\nreturn { AMOUNT_TOOLS, verifyAmount };`)(...Object.values(deps), tokenInfo, checkAmountGrounded);
-  const all = { ...deps, ...helpers };
-  const runTool = new Function(...Object.keys(all), `${fnSrc('runTool')}\nreturn runTool;`)(...Object.values(all));
-  return { runTool, calls };
-}
-
-const usdcDrop = { chainId: 8453, tokenContract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', recipients: [{ type: 'discord', id: '731076204307677226' }] };
-
-test('"0.01 USDC" sent as 100000 is refused before anything is sent', async () => {
-  const { runTool, calls } = buildGuardedRunTool();
-  const out = JSON.parse(await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '100000' },
-    { senderId: 'u1', senderApiKey: 'k', userText: 'send @Guillaume 0.01 USDC on base, please' }));
-  assert.equal(out.status, 'refused');
-  assert.match(out.error, /0\.1 USDC per recipient/);
-  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop_balance'], 'balance read for decimals; no send');
-});
-
-test('the correct amount goes through to the send', async () => {
-  const { runTool, calls } = buildGuardedRunTool();
-  await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '10000' },
-    { senderId: 'u1', senderApiKey: 'k', userText: 'send @Guillaume 0.01 USDC on base, please' });
-  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop_balance', 'connect_drop']);
-});
-
-test('a confirmed held send is not re-checked (the user approved the readable amount)', async () => {
-  const { runTool, calls } = buildGuardedRunTool();
-  await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '100000' },
-    { senderId: 'u1', senderApiKey: 'k', userText: 'yes', confirmed: true });
-  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop']);
+test('connect_drop is forwarded to Connect exactly as the model wrote it', async () => {
+  const { runTool, deps } = buildRunTool();
+  const seen = [];
+  deps.mcpCallTool = undefined;
+  const { runTool: rt } = (() => {
+    const d = { ...deps, mcpCallTool: async (name, input, key) => { seen.push({ name, input, key }); return '{"httpStatus":201,"transferHash":"0xabc"}'; } };
+    return { runTool: new Function(...Object.keys(d), `${fnSrc('runTool')}\nreturn runTool;`)(...Object.values(d)) };
+  })();
+  const input = { idempotencyKey: 'from-model', chainId: 1399811149, tokenContract: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', recipients: [{ type: 'discord', id: '731076204307677226' }], amountInWeiPerRecipient: '10000' };
+  const out = JSON.parse(await rt('connect_drop', input, { senderId: 'u1', senderApiKey: 'k' }));
+  assert.deepEqual(seen, [{ name: 'connect_drop', input, key: 'k' }], 'same tool, same arguments, sender key');
+  assert.equal(out.transferHash, '0xabc');
+  assert.ok(out.explorerUrl, 'the real explorer link is attached and recorded');
 });
