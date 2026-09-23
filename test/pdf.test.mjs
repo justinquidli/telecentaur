@@ -122,20 +122,20 @@ test('held action: one-shot, owner-only, snapshot, capped, expiring', () => {
   let now = 0;
   const store = createHeldActionStore({ now: () => now, ttlMs: 1000, maxPerUser: 2 });
   const input = structuredClone(drop);
-  const { code } = store.hold({ tool: 'quidli_drop', input, senderId: 'alice', channelId: -100, contextId: '-100' });
+  const { code } = store.hold({ tool: 'connect_drop', input, senderId: 'alice', channelId: -100, contextId: '-100' });
   input.amountInWeiPerRecipient = '999';
   assert.match(store.take(code, 'bob').error, /Only the person/);
   assert.equal(store.take(code, 'alice').action.input.amountInWeiPerRecipient, '1250000');
   assert.match(store.take(code, 'alice').error, /No pending transfer/);
-  store.hold({ tool: 'quidli_drop', input: drop, senderId: 'a', channelId: 1 });
-  const b = store.hold({ tool: 'quidli_drop', input: drop, senderId: 'a', channelId: 1 });
-  assert.match(store.hold({ tool: 'quidli_drop', input: drop, senderId: 'a', channelId: 1 }).error, /already have 2/);
+  store.hold({ tool: 'connect_drop', input: drop, senderId: 'a', channelId: 1 });
+  const b = store.hold({ tool: 'connect_drop', input: drop, senderId: 'a', channelId: 1 });
+  assert.match(store.hold({ tool: 'connect_drop', input: drop, senderId: 'a', channelId: 1 }).error, /already have 2/);
   now = 1001;
   assert.match(store.take(b.code, 'a').error, /expired/);
 });
 
 test('confirmation prompt is plain text with Telegram commands', () => {
-  const text = describeHeldAction({ code: 'ABC234', tool: 'quidli_drop', input: drop });
+  const text = describeHeldAction({ code: 'ABC234', tool: 'connect_drop', input: drop });
   assert.match(text, /Send now on Base: 1\.25 USDC each to 1 recipient/);
   assert.match(text, /→ @arnaud/);
   assert.match(text, /\/confirm ABC234.*\/cancel ABC234/);
@@ -163,7 +163,7 @@ test('records and links: queue drains once, links bounded, users cannot forge re
   links.add('c', 'a'); links.add('c', 'b'); links.add('c', 'a'); links.add('c', 'd');
   assert.deepEqual(links.list('c'), ['a', 'd']);
   assert.equal(neutraliseBotRecords(`${BOT_RECORD_MARKER}]`).includes(BOT_RECORD_MARKER), false);
-  assert.match(formatOutcomeRecord({ code: 'X', tool: 'quidli_drop', input: drop }, 'executed', 'tx 0x1', REAL), /ALREADY RUN \(tx 0x1\).*verified\): https/);
+  assert.match(formatOutcomeRecord({ code: 'X', tool: 'connect_drop', input: drop }, 'executed', 'tx 0x1', REAL), /ALREADY RUN \(tx 0x1\).*verified\): https/);
 });
 
 // ─── runTool gate ────────────────────────────────────────────────────────────
@@ -176,11 +176,12 @@ function buildRunTool() {
     MONEY_TOOLS, heldActions: createHeldActionStore(), describeHeldAction, heldToolResult,
     mcpToolNames: new Set(),
     MCP_CONFIRM_TOOLS,
+    MCP_WRAPPED_TOOLS,
     shutdown: { stopping: false, track: (p) => p },
     mcpCallTool: async (name, input, key) => { calls.push({ tool: name, key }); return '{"ok":true}'; },
     redactConnectMe: (t) => t,
     _pendingExplorerUrls: [],
-    quidliDrop: async (input, key) => { calls.push({ tool: 'quidli_drop', key }); return { transferHash: '0xabc', explorerUrl: REAL }; },
+    quidliDrop: async (input, key) => { calls.push({ tool: 'connect_drop', key }); return { status: 'submitted', transferHash: '0xabc', explorerUrl: REAL }; },
     db: { prepare: () => ({ run: () => calls.push({ tool: 'db-write' }), all: () => [], get: () => null }) },
     scheduleDropJob: () => {},
     executeConditionalDrop: () => {},
@@ -192,7 +193,7 @@ function buildRunTool() {
 }
 
 const moneyInputs = {
-  quidli_drop: drop,
+  connect_drop: drop,
   schedule_drop: { ...drop, delayMinutes: 5 },
   conditional_drop: { ...drop, condition: 'Did it rain?', checkAt: '2030-01-01T00:00:00Z' },
   create_watcher: { ...drop, triggerPhrase: 'gm' },
@@ -221,11 +222,11 @@ for (const [tool, input] of Object.entries(moneyInputs)) {
 
 test('without a document, drops run as before; keyless senders are refused, not held', async () => {
   const { runTool, calls, deps } = buildRunTool();
-  await runTool('quidli_drop', drop, { senderId: 1, senderApiKey: 'k', currentChatId: 1 });
+  await runTool('connect_drop', drop, { senderId: 1, senderApiKey: 'k', currentChatId: 1 });
   assert.equal(calls.length, 1);
-  const keyless = JSON.parse(await runTool('quidli_drop', drop, { senderId: 2, currentChatId: 1, documentInContext: true }));
+  const keyless = JSON.parse(await runTool('connect_drop', drop, { senderId: 2, currentChatId: 1, documentInContext: true }));
   assert.match(keyless.error, /No Quidli API key/);
-  const owner = JSON.parse(await runTool('quidli_drop', drop, { senderId: 'owner', currentChatId: 1, documentInContext: true }));
+  const owner = JSON.parse(await runTool('connect_drop', drop, { senderId: 'owner', currentChatId: 1, documentInContext: true }));
   assert.equal(owner.status, 'held_for_confirmation');
   assert.equal(deps.heldActions.size, 1);
 });
@@ -269,9 +270,9 @@ test('/confirm runs once, records outcome and verified link for the chat', async
   const ran = [];
   const { fn, deps, ctx, replies } = buildConfirm(async (tool, input, c) => {
     ran.push(c);
-    return JSON.stringify({ transferHash: REAL.split('/tx/')[1], explorerUrl: REAL });
+    return JSON.stringify({ status: 'submitted', transferHash: REAL.split('/tx/')[1], explorerUrl: REAL });
   });
-  const { code } = deps.heldActions.hold({ tool: 'quidli_drop', input: drop, senderId: '42', channelId: -100, contextId: '-100', isPrivateChat: false });
+  const { code } = deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: '42', channelId: -100, contextId: '-100', isPrivateChat: false });
 
   await fn(ctx(code, 7), 'confirm');
   assert.equal(ran.length, 0, 'another group member cannot confirm');
@@ -290,7 +291,7 @@ test('/confirm runs once, records outcome and verified link for the chat', async
 
 test('/cancel, failures, throws and bare /confirm', async () => {
   const c = buildConfirm(async () => { throw new Error('must not run'); });
-  const h = c.deps.heldActions.hold({ tool: 'quidli_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
+  const h = c.deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
   await c.fn(c.ctx(''), 'confirm');
   assert.match(c.replies.at(-1), /waiting for confirmation:.*\/confirm/s);
   await c.fn(c.ctx(h.code), 'cancel');
@@ -299,13 +300,13 @@ test('/cancel, failures, throws and bare /confirm', async () => {
   assert.match(c.replies.at(-1), /Usage: \/confirm/);
 
   const f = buildConfirm(async () => JSON.stringify({ error: 'insufficient balance', explorerUrl: REAL }));
-  const hf = f.deps.heldActions.hold({ tool: 'quidli_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
+  const hf = f.deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
   await f.fn(f.ctx(hf.code), 'confirm');
   assert.match(f.deps.heldOutcomeRecords.take('1')[0], /FAILED \(insufficient balance\)/);
   assert.deepEqual(f.deps.verifiedTxLinks.list('1'), []);
 
   const t = buildConfirm(async () => { throw new Error('socket hang up'); });
-  const ht = t.deps.heldActions.hold({ tool: 'quidli_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
+  const ht = t.deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
   await t.fn(t.ctx(ht.code), 'confirm');
   assert.match(t.deps.heldOutcomeRecords.take('1')[0], /OUTCOME IS UNKNOWN \(socket hang up\)/);
 });
@@ -354,12 +355,12 @@ test('handler wiring', () => {
 import { parseInlineConfirm } from '../held-actions.js';
 
 test('email and phone recipients show the address, not "id"', () => {
-  const email = describeHeldAction({ code: 'ABC234', tool: 'quidli_drop', input: { ...drop, recipients: [{ type: 'email', id: 'arnaud@girosense.com' }] } });
+  const email = describeHeldAction({ code: 'ABC234', tool: 'connect_drop', input: { ...drop, recipients: [{ type: 'email', id: 'arnaud@girosense.com' }] } });
   assert.match(email, /→ email arnaud@girosense\.com/);
   assert.doesNotMatch(email, /email id/);
-  const phone = describeHeldAction({ code: 'ABC234', tool: 'quidli_drop', input: { ...drop, recipients: [{ type: 'phone', username: '+33600000000' }] } });
+  const phone = describeHeldAction({ code: 'ABC234', tool: 'connect_drop', input: { ...drop, recipients: [{ type: 'phone', username: '+33600000000' }] } });
   assert.match(phone, /→ phone \+33600000000/);
-  const gh = describeHeldAction({ code: 'ABC234', tool: 'quidli_drop', input: { ...drop, recipients: [{ type: 'github', username: 'x' }] } });
+  const gh = describeHeldAction({ code: 'ABC234', tool: 'connect_drop', input: { ...drop, recipients: [{ type: 'github', username: 'x' }] } });
   assert.match(gh, /→ github @x/);
 });
 
@@ -384,17 +385,17 @@ test('"@bot /confirm CODE" goes to the confirm handler before any model or agent
 
 test('inline payload is used, and bare /confirm with nothing held explains how to get a code', async () => {
   const ran = [];
-  const { fn, deps, ctx, replies } = buildConfirm(async () => { ran.push(1); return JSON.stringify({ transferHash: '0x1', explorerUrl: REAL }); });
+  const { fn, deps, ctx, replies } = buildConfirm(async () => { ran.push(1); return JSON.stringify({ status: 'submitted', transferHash: '0x1', explorerUrl: REAL }); });
   await fn(ctx(''), 'confirm');
   assert.match(replies.at(-1), /Nothing is waiting.*\/confirm/);
-  const { code } = deps.heldActions.hold({ tool: 'quidli_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
+  const { code } = deps.heldActions.hold({ tool: 'connect_drop', input: drop, senderId: '42', channelId: 1, contextId: '1' });
   await fn(ctx(undefined), 'confirm', code); // ctx.payload absent, as in the text handler
   assert.equal(ran.length, 1);
 });
 
 // ─── Connect write tools: always confirmed, document or not ─────────────────
 
-import { MCP_CONFIRM_TOOLS } from '../connect-mcp.js';
+import { MCP_CONFIRM_TOOLS, MCP_WRAPPED_TOOLS } from '../connect-mcp.js';
 
 const trustInput = { to: { type: 'github', username: 'alice' }, level: 80, context: 'team:quidli' };
 
@@ -451,8 +452,8 @@ test('while the bot is shutting down, new money and trust actions are refused, r
   deps.shutdown.stopping = true;
   deps.mcpToolNames.add('connect_trust_create');
   deps.mcpToolNames.add('connect_lookup');
-  for (const tool of ['quidli_drop', 'connect_trust_create']) {
-    const out = JSON.parse(await runTool(tool, tool === 'quidli_drop' ? drop : trustInput, { senderId: 'u1', senderApiKey: 'k', confirmed: true }));
+  for (const tool of ['connect_drop', 'connect_trust_create']) {
+    const out = JSON.parse(await runTool(tool, tool === 'connect_drop' ? drop : trustInput, { senderId: 'u1', senderApiKey: 'k', confirmed: true }));
     assert.equal(out.status, 'refused');
     assert.match(out.error, /restarting/);
   }
@@ -467,4 +468,50 @@ test('a handler error is caught by tg.catch, not left to stop polling', () => {
   assert.ok(catchAt < launchAt, 'and registered before launch');
   assert.ok(SRC.includes('shutdown.install()'), 'signals go through shutdown.js');
   assert.ok(!/process\.once\('SIGINT', \(\) => tg\.stop/.test(SRC), 'old stop-only handler is gone');
+});
+
+// ─── amount check in the real send path ─────────────────────────────────────
+
+import { checkAmountGrounded, tokenInfo } from '../connect-drop.js';
+
+function buildGuardedRunTool() {
+  const verifySrc = SRC.match(/^async function verifyAmount[\s\S]*?\n}$/m)[0];
+  const amountToolsSrc = SRC.match(/^const AMOUNT_TOOLS = new Set\(\[[^\]]*\]\);$/m)[0];
+  const balance = { assets: [{ type: 'erc20', tokenContract: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC', decimals: 6 }] };
+  const { runTool: _unused, calls, deps } = buildRunTool();
+  deps.mcpCallTool = async (name, input, key) => {
+    calls.push({ tool: name, key });
+    if (name === 'connect_drop_balance') return JSON.stringify(balance);
+    return '{"ok":true}';
+  };
+  const helpers = new Function(...Object.keys(deps), 'tokenInfo', 'checkAmountGrounded',
+    `${amountToolsSrc}\n${verifySrc}\nreturn { AMOUNT_TOOLS, verifyAmount };`)(...Object.values(deps), tokenInfo, checkAmountGrounded);
+  const all = { ...deps, ...helpers };
+  const runTool = new Function(...Object.keys(all), `${fnSrc('runTool')}\nreturn runTool;`)(...Object.values(all));
+  return { runTool, calls };
+}
+
+const usdcDrop = { chainId: 8453, tokenContract: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', recipients: [{ type: 'discord', id: '731076204307677226' }] };
+
+test('"0.01 USDC" sent as 100000 is refused before anything is sent', async () => {
+  const { runTool, calls } = buildGuardedRunTool();
+  const out = JSON.parse(await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '100000' },
+    { senderId: 'u1', senderApiKey: 'k', userText: 'send @Guillaume 0.01 USDC on base, please' }));
+  assert.equal(out.status, 'refused');
+  assert.match(out.error, /0\.1 USDC per recipient/);
+  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop_balance'], 'balance read for decimals; no send');
+});
+
+test('the correct amount goes through to the send', async () => {
+  const { runTool, calls } = buildGuardedRunTool();
+  await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '10000' },
+    { senderId: 'u1', senderApiKey: 'k', userText: 'send @Guillaume 0.01 USDC on base, please' });
+  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop_balance', 'connect_drop']);
+});
+
+test('a confirmed held send is not re-checked (the user approved the readable amount)', async () => {
+  const { runTool, calls } = buildGuardedRunTool();
+  await runTool('connect_drop', { ...usdcDrop, amountInWeiPerRecipient: '100000' },
+    { senderId: 'u1', senderApiKey: 'k', userText: 'yes', confirmed: true });
+  assert.deepEqual(calls.map((c) => c.tool), ['connect_drop']);
 });

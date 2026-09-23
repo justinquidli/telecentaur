@@ -94,7 +94,6 @@ cp .env.example .env
 | `NOUS_MODEL` | — | Defaults to `poolside/laguna-s-2.1:free` (free tier, supports tool calling) |
 | `HOST_KEY_ALLOWED_USERS` | — | Handles/IDs allowed to spend the host's LLM keys. Empty = owner only |
 | `TELEGRAM_ALLOWED_USERS` | — | Comma-separated Telegram user IDs allowed to use the bot. Empty = everyone |
-| `BOT_WALLET_PRIVATE_KEY` | — | Private key of a funded wallet for x402 pay-per-request. Note: lookup, scores and balance now go over MCP, which authenticates by API key only — so x402 no longer covers them |
 | `SYSTEM_PROMPT` | — | Override the default system prompt |
 
 ### 3. Enable Smart Send (for token drops)
@@ -186,8 +185,27 @@ MCP 0.5.8 that was nine tools (the trust tools below came later):
 | `connect_get_chains` | which chains support which features |
 | `connect_get_price` | x402 list prices |
 
-`connect_drop` is **never** offered to the model. It is annotated non-read-only, so the gate
-withholds it; drops go through the hardcoded `quidli_drop`.
+`connect_drop` is the only way the bot sends. It is annotated non-read-only, and is offered only
+because it is named in `MCP_WRAPPED_TOOLS`: the model sees Connect's own description and schema
+(minus `idempotencyKey`), but `runTool` never forwards the call as-is. It goes through
+`connect-drop.js`, which every other send path uses too — scheduled and conditional drops,
+watchers, claim links and swap-and-send:
+
+- **The bot owns the idempotency key.** Each send gets one key; a timeout, 5xx or 202 "processing"
+  is retried with the *same* key, so Connect dedupes and a retry can't become a second payment.
+- **Three outcomes.** `submitted` (sent), `failed` (Connect refused before sending), `unknown`
+  (may have gone through — reported as such, never offered for a resend).
+- **The amount must be one the user wrote.** Amounts are raw base units (0.01 USDC = `10000`). A
+  model once sent `100000` for "0.01 USDC". Before any send the bot reads the token's decimals
+  from `connect_drop_balance`, converts the amount back, and refuses unless it matches a number in
+  the user's message — per recipient, or as the total across the recipients. A confirmed held send
+  isn't re-checked: the user approved the readable amount.
+- **Connect resolves recipients.** Social recipients are passed straight through; Connect picks
+  the Ethereum or Solana address for the chain. The bot no longer resolves them itself.
+
+The hand-written REST `/drop` call, the x402 host-wallet payment path and `BOT_WALLET_PRIVATE_KEY`
+are gone. A host `QUIDLI_API_KEY` is optional: without one, discovery runs anonymously and only
+users with their own linked key can send.
 
 Trust tools: `connect_trust_check` and `connect_trust_graph` are read-only and register like the
 rest. `connect_trust_create` and `connect_trust_revoke` are write tools — they sign an EAS
@@ -236,7 +254,7 @@ unless the user names another, but Ethereum (1), Optimism (10), Polygon (137), A
 Avalanche (43114) and Solana (1399811149) all work. `connect_get_chains` lets the model answer
 chain questions from the server rather than guessing.
 
-Explorer links follow the chain. `CHAIN_EXPLORERS` maps a chainId to its explorer and `quidliDrop()`
+Explorer links follow the chain. `CHAIN_EXPLORERS` maps a chainId to its explorer and the send path (`connect-drop.js`)
 attaches the right link to its own result, so no caller has to know which chain was used. A chain
 absent from that map yields no link rather than a wrong one — which is safer than the previous
 behaviour, where every link was hardcoded to `basescan.org`.
@@ -429,7 +447,7 @@ Send a PDF — in a DM, or in a group with a caption that mentions the bot (or r
 - Text extraction only (`unpdf`). Scanned / image-only and password-protected PDFs are refused with a message. Non-PDF files are declined.
 - The text goes into the conversation history (the chat's, or the addressed agent's thread), so follow-ups work until it ages out.
 
-**Transfers are held while a document is in the chat.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So for 40 turns after anyone uploads one to a chat — long enough for the document, and every reply or agent digest that quoted it, to leave the history — `quidli_drop`, `schedule_drop`, `conditional_drop`, `create_watcher` and `create_pending_claim` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
+**Transfers are held while a document is in the chat.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So for 40 turns after anyone uploads one to a chat — long enough for the document, and every reply or agent digest that quoted it, to leave the history — `connect_drop`, `schedule_drop`, `conditional_drop`, `create_watcher` and `create_pending_claim` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
 
 ```
 /confirm K7QM2P   — run it
@@ -448,10 +466,9 @@ Enforced in `runTool`, not the prompt. Logic in `documents.js` and `held-actions
 ## Tool-loop safety
 
 Every user message is capped at **25 tool round-trips** (`MAX_TOOL_ROUNDS`) across all
-providers. A drop typically uses 3–15 (resolve → lookup retries → drop), so the cap only
-trips on a model that's looping. This matters because the model mints each
-`quidli_drop` idempotency key, so an unbounded loop would issue repeated *distinct*
-transfers rather than harmless retries. On hitting the cap the bot stops and says so.
+providers. A send is usually 1–2 (connect_drop, sometimes a balance check first), so the cap only
+trips on a model that's looping. It still matters: each connect_drop call gets its own
+idempotency key, so a model that calls it repeatedly issues *distinct* transfers, not retries. On hitting the cap the bot stops and says so.
 
 Two related guards on the OpenAI-compatible path (OpenAI, OpenRouter, Hermes):
 
@@ -489,15 +506,14 @@ pending-claim restore.
 
 ## How recipients are resolved
 
-Every drop resolves its recipients to wallet addresses first (`recipients.js`), then sends to
-those addresses. Connect's `/drop` currently rejects social recipients outright
-(`recipients.0.property type should not exist`), even though `connect_lookup` accepts the same
-shape — observed 2026-09-15 and again in both bots' logs on 2026-09-16.
+Connect's `connect_drop` resolves social recipients itself (email, phone, Telegram, Discord,
+Farcaster, X, GitHub) and pays the Ethereum address on EVM chains or the Solana address on Solana,
+creating a wallet for people who don't have one. linkedin and slack aren't accepted by
+`connect_drop`; the model looks those up with `connect_lookup` and sends to the returned address.
 
-Resolution is all-or-nothing: if any recipient can't be resolved, **nothing** is sent and the
-bot names who failed, rather than paying some of the list. Looking up a recipient who has no
-wallet provisions one for them, which is what lets the bots pay people who have never used
-crypto. This applies to every drop — direct, scheduled, conditional, watchers and claim links.
+`recipients.js` (EVM wallet resolution) is now used only by Bankr swap-and-send, which needs
+wallet addresses up front. It used to run before every drop, because `/drop` rejected social
+recipients in mid-September; it always picked the EVM address, which made every Solana drop fail.
 
 ## Bankr — swaps and market data
 
@@ -517,4 +533,4 @@ Without a linked key, both tools refuse and nothing else about the bot changes.
 
 ## Shared files
 
-`bankr.js`, `recipients.js` and their tests must be identical in TeleCentaur and DiscoCentaur (list: `scripts/shared-files.mjs`). `npm test` fails if they drift, when the other repo sits next to this one (or `SHARED_SIBLING=/path`). Edit in one repo, then run `npm run sync-shared` there to copy the files over, review `git diff` in the other repo, and commit both.
+The files listed in `scripts/shared-files.mjs` (bankr, recipients, connect-drop, connect-mcp, secrets, shutdown and their tests) must be identical in TeleCentaur and DiscoCentaur (list: `scripts/shared-files.mjs`). `npm test` fails if they drift, when the other repo sits next to this one (or `SHARED_SIBLING=/path`). Edit in one repo, then run `npm run sync-shared` there to copy the files over, review `git diff` in the other repo, and commit both.
