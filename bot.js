@@ -31,6 +31,7 @@ import {
 } from './held-actions.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
+import { createMcpRegistry, MCP_CONFIRM_TOOLS } from './connect-mcp.js';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -1126,17 +1127,9 @@ const RECIPIENT_SCHEMA = {
 // The server is stateless and reads x-api-key per request, so each call is made
 // with the *sender's* key — same per-user model as the REST path.
 const MCP_URL = process.env.CONNECT_MCP_URL || 'https://mcp.connect.quid.li/';
-// Tools are gated by the server's own readOnlyHint annotation rather than by a
-// name list here, so a new read-only Connect tool appears after a restart with
-// no code change. This fails CLOSED: a tool with no readOnlyHint is not offered
-// to the model at all, so a future spend-shaped tool cannot arrive by surprise.
-//
-// MCP_LEGACY_ALLOWLIST is the fallback for a Connect MCP older than the
-// annotations. If the server annotates nothing we cannot tell a read from a
-// spend, so we offer exactly the five tools we always have rather than guessing
-// from the name.
-const MCP_LEGACY_ALLOWLIST = new Set(['connect_drop_balance', 'connect_scores_batch', 'connect_lookup', 'connect_lookup_exposed', 'connect_me']);
-const mcpToolNames = new Set();
+// Which tools the model may see — read-only ones automatically, write tools
+// only if named in MCP_CONFIRM_TOOLS — and the periodic re-read of tools/list
+// live in connect-mcp.js. See createMcpRegistry() below.
 
 // Plain JSON-RPC over POST rather than the MCP SDK. The server is stateless —
 // it builds a fresh transport per request and needs no initialize handshake, so
@@ -1211,55 +1204,10 @@ async function mcpCallTool(name, args, apiKey) {
   return text || JSON.stringify(res?.structuredContent ?? {});
 }
 
-// Decides which discovered tools the model may see. Pure and exported for tests:
-// this is the gate that keeps the money path away from the model, so it is the
-// one piece of MCP wiring that must never be changed without a test.
-//
-// A server that annotates ANY tool is treated as annotation-capable, so an
-// unannotated tool from that server is withheld — fail closed. A server that
-// annotates nothing at all predates the feature; there we fall back to the
-// legacy names rather than inferring intent from a tool's name.
-function selectMcpTools(offered) {
-  const list = Array.isArray(offered) ? offered : [];
-  const annotated = list.some((t) => typeof t?.annotations?.readOnlyHint === 'boolean');
-  const register = [];
-  const skipped = [];
-  for (const t of list) {
-    if (!t?.name) continue;
-    const allow = annotated
-      ? t.annotations?.readOnlyHint === true
-      : MCP_LEGACY_ALLOWLIST.has(t.name);
-    (allow ? register : skipped).push(t);
-  }
-  return { register, skipped: skipped.map((t) => t.name), annotated };
-}
-
-// Discovered once at startup using the host key — reads schemas only, no side
-// effects. If Connect's MCP is unreachable the bot starts normally with the
-// hardcoded tools; these are additive, so nothing existing depends on them.
-async function registerMcpTools() {
-  if (!QUIDLI_API_KEY) return;
-  try {
-    const discovered = await mcpRpc('tools/list', {}, QUIDLI_API_KEY);
-    const { register, skipped, annotated } = selectMcpTools(discovered?.tools ?? []);
-    if (!annotated) {
-      console.error('[mcp] ⚠️  server sent no readOnlyHint annotations — falling back to the legacy allowlist. Upgrade Connect MCP to auto-register new tools.');
-    }
-    for (const t of register) {
-      tools.push({ name: t.name, description: t.description ?? '', input_schema: t.inputSchema });
-      mcpToolNames.add(t.name);
-    }
-    // A tool we have always offered that no longer arrives means Connect renamed
-    // it, pulled it, or stopped marking it read-only. Some of these replace
-    // hardcoded tools, so a silent miss is a capability that just disappears.
-    const missing = [...MCP_LEGACY_ALLOWLIST].filter((n) => !mcpToolNames.has(n));
-    if (missing.length) console.error(`[mcp] ⚠️  expected but NOT registered: ${missing.join(', ')}`);
-    if (skipped.length) console.log(`   Connect MCP: withheld (${annotated ? 'not read-only' : 'not in the legacy allowlist'}): ${skipped.join(', ')}`);
-    console.log(`   Connect MCP: ${mcpToolNames.size ? [...mcpToolNames].join(', ') : 'no tools registered'}`);
-  } catch (err) {
-    console.error('[mcp] tool discovery failed, continuing without it:', err.message);
-  }
-}
+// Discovered at startup and re-read every MCP_REFRESH_MS using the host key —
+// reads schemas only, no side effects. If Connect's MCP is unreachable the bot
+// runs with the hardcoded tools plus whatever it last saw; nothing existing
+// depends on these. Declared after `tools` so the registry can own its MCP half.
 
 const tools = [
   {
@@ -1443,6 +1391,15 @@ const tools = [
   },
 ];
 
+const mcpRegistry = createMcpRegistry({ tools, listTools: () => mcpRpc('tools/list', {}, QUIDLI_API_KEY) });
+const mcpToolNames = mcpRegistry.names;
+
+function registerMcpTools() {
+  if (!QUIDLI_API_KEY) return;
+  mcpRegistry.refresh();
+  mcpRegistry.start();
+}
+
 // Tracks explorer URLs produced during a turn so they're always shown
 const _pendingExplorerUrls = [];
 
@@ -1517,6 +1474,25 @@ async function runTool(name, input, {
       console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
       heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
       return heldToolResult(held.code);
+    }
+  }
+
+  // ── Confirm gate for Connect write tools ────────────────────────────────────
+  // connect_trust_create / _revoke sign an attestation from the key owner's
+  // wallet. They always wait for /confirm, document or not: in a group chat another
+  // member's message can steer the model as easily as a PDF can. With no usable
+  // key we fall through — the call 401s and nothing is written.
+  if (MCP_CONFIRM_TOOLS.has(name) && mcpToolNames.has(name) && !confirmed) {
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    if (senderApiKey || isOwner) {
+      const held = heldActions.hold({
+        tool: name, input, senderId: String(senderId), channelId: currentChatId,
+        contextId: contextId ?? String(currentChatId), isPrivateChat,
+      });
+      if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
+      console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
+      return heldToolResult(held.code, name);
     }
   }
 
@@ -2819,7 +2795,11 @@ async function handleConfirmCommand(ctx, verb, payload = ctx.payload) {
     if (i !== -1) _pendingExplorerUrls.splice(i, 1);
   }
 
-  const succeeded = action.tool === 'quidli_drop' ? !!result.transferHash
+  // Connect write tools return the server's own text; runTool throws on an MCP
+  // error and returns an 'Error: …' string when the key is missing.
+  const isConnectWrite = MCP_CONFIRM_TOOLS.has(action.tool);
+  const succeeded = isConnectWrite ? !String(raw ?? '').startsWith('Error:')
+    : action.tool === 'quidli_drop' ? !!result.transferHash
     : action.tool === 'bankr_agent' || action.tool === 'bankr_swap_and_drop' ? result.status === 'completed'
     : (!!result.success && !result.error);
   if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
@@ -2834,7 +2814,7 @@ async function handleConfirmCommand(ctx, verb, payload = ctx.payload) {
         : result.watcherId ? `watcher ${result.watcherId}`
         : result.claimLink ? `claim link ${result.claimLink}` : '',
       result.explorerUrl)
-    : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? ''));
+    : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? (isConnectWrite ? String(raw ?? '') : '')));
 
   if (action.tool === 'bankr_swap_and_drop') {
     const links = (result.explorerUrls ?? []).map((u) => `\n🔗 ${u}`).join('');
@@ -2847,6 +2827,10 @@ async function handleConfirmCommand(ctx, verb, payload = ctx.payload) {
       : result.status === 'still_running'
         ? `⏳ ${action.code}: Bankr is still processing (job ${result.jobId}). It may still execute — check your Bankr wallet before asking again.`
         : `❌ ${action.code} did not go through: ${String(result.error ?? raw).slice(0, 300)}`);
+  } else if (isConnectWrite) {
+    await say(succeeded
+      ? `✅ Done (${action.code}): ${String(result.message ?? raw).slice(0, 800)}`
+      : `❌ ${action.code} did not go through: ${String(raw ?? '').slice(0, 300)}`);
   } else if (action.tool === 'quidli_drop') {
     await say(result.transferHash
       ? `✅ Sent (${action.code}).${result.explorerUrl ? `\n🔗 ${result.explorerUrl}` : `\nTransfer hash: ${result.transferHash}`}`

@@ -18,6 +18,7 @@
  * Side-effect free so tests can import it.
  */
 import { randomInt } from 'node:crypto';
+import { MCP_CONFIRM_TOOLS } from './connect-mcp.js';
 
 // Tools whose execution commits the sender's funds, now or later.
 // bankr_agent is here because a Bankr prompt can swap or transfer from the
@@ -175,19 +176,40 @@ export function describeHeldAction({ code, tool, input }) {
   } else if (tool === 'create_pending_claim') {
     lines.push(`Claim link on ${chain}: ${amount} for @${String(input.recipientUsername ?? '?').replace(/^@/, '')}`);
     lines.push('The link is created only after you confirm; it pays out as soon as they tap it (valid 3 days).');
+  } else if (tool === 'connect_trust_create') {
+    lines.push(`Trust attestation on Base, signed by your Connect wallet: trust ${describeRecipient(input.to)} at level ${Number(input.level)}/100`);
+    lines.push(`Context: ${input.context ? `“${String(input.context).slice(0, 64)}”` : 'none'} · Expires: ${input.expiresIn ? `in ${Math.round(Number(input.expiresIn) / 3600)} h` : 'never'}`);
+  } else if (tool === 'connect_trust_revoke') {
+    lines.push(`Revoke trust on Base, signed by your Connect wallet: ${describeRecipient(input.to)}`);
+    lines.push(input.context ? `Only context “${String(input.context).slice(0, 64)}”` : 'Every context you trust them in');
+  } else if (MCP_CONFIRM_TOOLS.has(tool)) {
+    lines.push(`${tool} with ${JSON.stringify(input).slice(0, 400)}`);
   } else {
     lines.push(tool);
   }
 
   return (
-    `⏸️ Held for confirmation — a document is in this conversation, so transfers don't run automatically.\n` +
+    (MCP_CONFIRM_TOOLS.has(tool)
+      ? `⏸️ Needs your confirmation — changes to your trust graph never run automatically.\n`
+      : `⏸️ Held for confirmation — a document is in this conversation, so transfers don't run automatically.\n`) +
     lines.join('\n') +
     `\nSend /confirm ${code} to run it, or /cancel ${code}. Expires in ${Math.round(HOLD_TTL_MS / 60000)} min.`
   );
 }
 
 /** What the model sees instead of a transfer result. */
-export function heldToolResult(code) {
+export function heldToolResult(code, tool = null) {
+  if (MCP_CONFIRM_TOOLS.has(tool)) {
+    return JSON.stringify({
+      status: 'held_for_confirmation',
+      executed: false,
+      code,
+      message:
+        'NOT done. Trust changes always wait for the user to confirm them. ' +
+        'The bot has already posted the details and the confirm command beneath your reply — do not repeat the code ' +
+        'and do not say the change was made. Briefly tell the user it is waiting for their confirmation.',
+    });
+  }
   return JSON.stringify({
     status: 'held_for_confirmation',
     executed: false,
@@ -229,6 +251,8 @@ export function neutraliseBotRecords(text) {
 }
 
 function summarise({ tool, input }) {
+  if (tool === 'connect_trust_create') return `trust attestation for ${input.to?.type}:${input.to?.id ?? input.to?.username} at level ${input.level}${input.context ? ` in context ${input.context}` : ''}`;
+  if (tool === 'connect_trust_revoke') return `trust revocation for ${input.to?.type}:${input.to?.id ?? input.to?.username}${input.context ? ` in context ${input.context}` : ' in every context'}`;
   if (tool === 'bankr_swap_and_drop') return `swap via Bankr of ${input.sellAmount} ${input.sellToken} → ${input.buyToken} (source ${input.source ?? 'connect'}), then ${Array.isArray(input.recipients) && input.recipients.length ? (input.sendAll === true ? `all of it split to ${input.recipients.length} recipients` : `${input.amountPerRecipient} each to ${input.recipients.length} recipients`) : 'kept in Connect'}`;
   if (tool === 'bankr_agent') return `Bankr agent request “${String(input.prompt ?? '').replace(/[\r\n\]]/g, ' ').slice(0, 150)}”`;
   const chainId = input.chainId ?? 8453;
@@ -253,7 +277,7 @@ export function formatOutcomeRecord(action, outcome, detail = '', explorerUrl = 
     cancelled: 'was CANCELLED by the user. Nothing was sent',
   }[outcome];
   const link = explorerUrl ? ` Explorer link (verified): ${explorerUrl}` : '';
-  return `${BOT_RECORD_MARKER} — written by the bot, not by any user: held transfer ${action.code} (${what}) ${status}.${link}]`;
+  return `${BOT_RECORD_MARKER} — written by the bot, not by any user: held ${MCP_CONFIRM_TOOLS.has(action.tool) ? 'action' : 'transfer'} ${action.code} (${what}) ${status}.${link}]`;
 }
 
 export function createRecordQueue({ maxPerContext = 10 } = {}) {

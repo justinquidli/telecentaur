@@ -17,6 +17,7 @@ import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { selectMcpTools } from '../connect-mcp.js';
 
 const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'bot.js'), 'utf8');
 const grab = (name) => {
@@ -204,7 +205,7 @@ test('switch phrases keep their meaning; agent names extend them', () => {
 test('the MCP fallback allowlist never duplicates a hardcoded tool', () => {
   // Offering connect_lookup alongside quidli_lookup would leave the model
   // choosing between two tools that do the same thing. This is the guard.
-  const allowlist = SRC.match(/const MCP_LEGACY_ALLOWLIST = new Set\(\[([^\]]*)\]\)/)[1]
+  const allowlist = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'connect-mcp.js'), 'utf8').match(/const MCP_LEGACY_ALLOWLIST = new Set\(\[([^\]]*)\]\)/)[1]
     .split(',').map((s) => s.trim().replace(/['"]/g, '')).filter(Boolean);
 
   const hardcoded = [...SRC.matchAll(/^    name: '([a-z_]+)',$/gm)].map((m) => m[1]);
@@ -520,10 +521,8 @@ test('connect_me redaction fails closed on an unexpected shape', () => {
 
 
 // ── Tool gating: readOnlyHint, not a name list ───────────────────────────────
-const buildSelect = () => {
-  const legacy = SRC.match(/^const MCP_LEGACY_ALLOWLIST = new Set\(\[[^\]]*\]\);$/m)[0];
-  return build(`${legacy}\n${grab('selectMcpTools')}`, 'selectMcpTools');
-};
+// selectMcpTools lives in connect-mcp.js now; more cases in connect-mcp.test.mjs.
+const buildSelect = () => selectMcpTools;
 
 test('read-only tools auto-register and connect_drop never does', () => {
   const selectMcpTools = buildSelect();
