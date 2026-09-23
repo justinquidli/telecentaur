@@ -1842,10 +1842,13 @@ function loadPendingDrops() {
 
 // ─── LLM clients ──────────────────────────────────────────────────────────────
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+// Model calls give up after 2 min and retry once, instead of the SDK default
+// of 10 min × 3 tries — a stalled provider left "Thinking…" up for ages.
+const LLM_TIMEOUT = { timeout: 120_000, maxRetries: 1 };
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY, ...LLM_TIMEOUT });
 
 function getAnthropicClient(userApiKey) {
-  if (userApiKey) return new Anthropic({ apiKey: userApiKey });
+  if (userApiKey) return new Anthropic({ apiKey: userApiKey, ...LLM_TIMEOUT });
   return anthropic;
 }
 
@@ -1862,6 +1865,7 @@ async function getOpenAIClient(userApiKey, baseURL, headers) {
   const { default: OpenAI } = await import('openai');
   return new OpenAI({
     apiKey: key,
+    ...LLM_TIMEOUT,
     ...(baseURL ? { baseURL } : {}),
     ...(headers ? { defaultHeaders: headers } : {}),
   });
