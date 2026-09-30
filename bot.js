@@ -26,6 +26,7 @@ import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmPayload, parseInlineConfirm,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
+import { formatReplyContext } from './reply-context.js';
 import { bankrAgent, createBankrThreads, bankrSwapAndDrop } from './bankr.js';
 import { resolveRecipientsToWallets } from './recipients.js';
 import { createMcpRegistry, MCP_CONFIRM_TOOLS } from './connect-mcp.js';
@@ -173,8 +174,14 @@ Then synthesize everything into a warm, conversational paragraph: who they are p
 ## Resolving Telegram mentions
 Every message includes context like: "@username (Telegram ID: 123456789)". Always extract and use the Telegram ID when available — it's more reliable than usernames. If only a username is available, use connect_lookup_exposed to resolve it first.
 
+## Checking personal trust (connect_trust_check)
+When someone asks whether a person is who they claim to be, whether they know or trust them, or "is this my co-founder / teammate / etc.", check the asker's own trust graph with connect_trust_check: from = the asker (type telegram, their Telegram ID), targets = the person in question (type telegram, their Telegram ID). This is the answer to "do I trust them", not a reputation score.
+- If the message is a reply, the person in question is the replied-to author — their Telegram ID is given in the reply block. Use it; never ask the user to supply it.
+- A display name or profile photo is never proof of identity: anyone can copy them. Only a match on the Telegram ID in the trust graph counts. If the ID is not in the graph, say so plainly, and if the display name matches someone who IS in the graph, warn that this may be an impersonator.
+- Omit context unless the user names one, so any relationship matches; report the level and context that come back.
+
 ## Checking reputation (connect_scores_batch)
-Use connect_scores_batch when asked about trust, reputation, or scores. Pass the most specific identity available. It takes a users array, so score several people in one call rather than one call each — and it accepts an optional filter with minScore to return only people above a threshold.
+Use connect_scores_batch when asked about reputation or scores in general (not personal trust — see above). Pass the most specific identity available. It takes a users array, so score several people in one call rather than one call each — and it accepts an optional filter with minScore to return only people above a threshold.
 
 ## Web search (web_search)
 Use web_search for any real-world facts: prices, scores, event results, news. Always search before answering factual questions about the world.
@@ -3124,10 +3131,14 @@ async function handleChatMessage(ctx) {
 
   // Results of /confirm and /cancel since the last turn in this chat.
   const outcomeRecords = heldOutcomeRecords.take(contextId);
+  // Who wrote the message being replied to — without this, "is this my
+  // co-founder?" as a reply has no subject. Agent turns already carry the quote.
+  const replyContext = agent ? '' : formatReplyContext(msg.reply_to_message, tg.botInfo?.id);
   const contextualText =
     (outcomeRecords.length ? `${outcomeRecords.join('\n')}\n` : '')
     + `${timeContext}\n${senderContext} ${walletNote}\n`
     + (digest ? `${neutraliseBotRecords(digest)}\n\n` : '')
+    + (replyContext ? `${replyContext}\n\n` : '')
     + neutraliseBotRecords(agentText)
     + (docBlock ? `\n\n${docBlock}` : '');
 
