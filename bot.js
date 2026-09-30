@@ -416,6 +416,8 @@ function setUserApiKey(telegramId, apiKey) {
 // send for keys connected before this existed). See holdReason in held-actions.js.
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN send_guard TEXT`); } catch { }
 try { db.exec(`ALTER TABLE user_keys ADD COLUMN send_guard_asked INTEGER`); } catch { }
+// 'quotes' was the first name for 'replies'.
+db.exec("UPDATE user_keys SET send_guard = 'replies' WHERE send_guard = 'quotes'");
 
 function getSendGuard(telegramId) {
   return db.prepare('SELECT send_guard FROM user_keys WHERE telegram_id = ?').get(String(telegramId))?.send_guard ?? null;
@@ -2348,7 +2350,7 @@ tg.command('guard', async (ctx) => {
   const said = {
     none: '✅ No guardrail — sends run as soon as you ask.',
     all: '✅ Every send now waits for your /confirm.',
-    quotes: '✅ Sends now wait for /confirm when your message quotes someone else.',
+    replies: '✅ Sends now wait for /confirm when you\'re replying to someone else\'s message.',
   }[choice];
   return ctx.reply(`${said} A document in the chat still makes sends wait.`).catch(() => {});
 });
@@ -3201,7 +3203,7 @@ async function handleChatMessage(ctx) {
   if (docBlock) documentTaint.mark(contextId);
   const historyKey = agent ? agentContextId(contextId, agent.agent_name) : contextId;
   // Someone else's text in this turn: a reply block, or an agent turn's quote.
-  // Only the user's own /guard quotes setting makes this hold a send.
+  // Only the user's own /guard replies setting makes this hold a send.
   const quotesOther = !!replyContext || (!!agent && msg.reply_to_message?.from?.id !== tg.botInfo?.id
     && !!(msg.reply_to_message?.text ?? msg.reply_to_message?.caption));
   const documentInContext = documentTaint.isTainted(contextId) || historyHasDocument(

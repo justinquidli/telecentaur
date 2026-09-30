@@ -20,9 +20,10 @@ test('all: every send waits', () => {
   assert.equal(holdReason({ ...send, guard: 'all' }), 'guard_all');
 });
 
-test('quotes: only a turn that quotes someone else waits', () => {
-  assert.equal(holdReason({ ...send, guard: 'quotes' }), null);
-  assert.equal(holdReason({ ...send, guard: 'quotes', quotesOther: true }), 'guard_quotes');
+test('replies: only a turn that replies to someone else waits', () => {
+  assert.equal(holdReason({ ...send, guard: 'replies' }), null);
+  assert.equal(holdReason({ ...send, guard: 'replies', quotesOther: true }), 'guard_replies');
+  assert.equal(holdReason({ ...send, guard: 'quotes', quotesOther: true }), 'guard_replies', 'old stored value still works');
 });
 
 test('a document holds whatever the user picked', () => {
@@ -43,28 +44,29 @@ test('every money tool is covered, not just connect_drop', () => {
 test('parseSendGuard reads the three choices and rejects anything else', () => {
   assert.equal(parseSendGuard('none'), 'none');
   assert.equal(parseSendGuard(' ALL '), 'all');
-  assert.equal(parseSendGuard('quotes'), 'quotes');
+  assert.equal(parseSendGuard('replies'), 'replies');
+  assert.equal(parseSendGuard('quotes'), 'replies');
   assert.equal(parseSendGuard(''), null);
   assert.equal(parseSendGuard('50'), null);
 });
 
 test('the prompt names all three commands', () => {
   const p = sendGuardPrompt('/');
-  for (const c of ['/guard none', '/guard all', '/guard quotes']) assert.ok(p.includes(c), c);
+  for (const c of ['/guard none', '/guard all', '/guard replies']) assert.ok(p.includes(c), c);
 });
 
 test('the held notice and model result say why it was held', () => {
   const input = { chainId: 8453, amountInWeiPerRecipient: '1000000', recipients: [{ type: 'telegram', id: '1' }] };
   assert.match(describeHeldAction({ code: 'ABC123', tool: 'connect_drop', input, reason: 'guard_all' }), /you asked to confirm every send/);
-  assert.match(describeHeldAction({ code: 'ABC123', tool: 'connect_drop', input, reason: 'guard_quotes' }), /quotes someone else/);
+  assert.match(describeHeldAction({ code: 'ABC123', tool: 'connect_drop', input, reason: 'guard_replies' }), /replying to someone else/);
   assert.match(describeHeldAction({ code: 'ABC123', tool: 'connect_drop', input }), /a document is in this conversation/);
   assert.match(JSON.parse(heldToolResult('ABC123', null, 'guard_all')).message, /confirm every send/);
 });
 
 test('the reason survives in the store, so the pending list shows it', () => {
   const store = createHeldActionStore();
-  const { code } = store.hold({ tool: 'connect_drop', input: {}, senderId: '1', channelId: '1', reason: 'guard_quotes' });
-  assert.equal(store.listFor('1')[0].reason, 'guard_quotes');
+  const { code } = store.hold({ tool: 'connect_drop', input: {}, senderId: '1', channelId: '1', reason: 'guard_replies' });
+  assert.equal(store.listFor('1')[0].reason, 'guard_replies');
   assert.ok(code);
 });
 
@@ -104,14 +106,14 @@ function buildRunTool() {
 }
 const drop = { chainId: 8453, amountInWeiPerRecipient: '1000000', recipients: [{ type: 'telegram', id: '9' }] };
 
-test('runTool: guard quotes holds a quoting turn and runs a plain one', async () => {
+test('runTool: guard replies holds a replying turn and runs a plain one', async () => {
   const { runTool, calls, deps } = buildRunTool();
-  deps.guards['42'] = 'quotes';
+  deps.guards['42'] = 'replies';
   const notices = [];
   const held = JSON.parse(await runTool('connect_drop', drop, { senderId: 42, senderApiKey: 'k', currentChatId: 1, quotesOther: true, heldNotices: notices }));
   assert.equal(held.status, 'held_for_confirmation');
   assert.equal(calls.length, 0, 'nothing sent');
-  assert.match(notices[0], /quotes someone else/);
+  assert.match(notices[0], /replying to someone else/);
   await runTool('connect_drop', drop, { senderId: 42, senderApiKey: 'k', currentChatId: 1 });
   assert.equal(calls.length, 1, 'plain turn sends');
 });
@@ -132,7 +134,7 @@ test('runTool: a user who never chose is asked once, and that send still runs', 
   await runTool('connect_drop', drop, { senderId: 42, senderApiKey: 'k', currentChatId: 1, heldNotices: n2 });
   assert.equal(calls.length, 2, 'both sends ran');
   assert.equal(n1.length, 1);
-  assert.match(n1[0], /\/guard quotes/);
+  assert.match(n1[0], /\/guard replies/);
   assert.equal(n2.length, 0, 'asked only once');
 });
 
