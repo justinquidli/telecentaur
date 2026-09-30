@@ -68,7 +68,7 @@ export function createHeldActionStore({ now = () => Date.now(), ttlMs = HOLD_TTL
 
   return {
     /** @returns {{ code: string } | { error: string }} */
-    hold({ tool, input, senderId, channelId, contextId = null, isPrivateChat = false }) {
+    hold({ tool, input, senderId, channelId, contextId = null, isPrivateChat = false, reason = 'document' }) {
       sweep();
       const mine = [...held.values()].filter((a) => a.senderId === senderId).length;
       if (mine >= maxPerUser) {
@@ -77,7 +77,7 @@ export function createHeldActionStore({ now = () => Date.now(), ttlMs = HOLD_TTL
       const code = newCode();
       // Deep copy: what gets confirmed is exactly what was shown, whatever
       // happens to the model's argument object afterwards.
-      held.set(code, { code, tool, input: structuredClone(input), senderId, channelId, contextId, isPrivateChat, createdAt: now() });
+      held.set(code, { code, tool, input: structuredClone(input), senderId, channelId, contextId, isPrivateChat, reason, createdAt: now() });
       return { code };
     },
 
@@ -132,7 +132,7 @@ function describeRecipient(r) {
  * The confirmation prompt. Built from the held arguments only — never from
  * model text — so what the user approves is what will run.
  */
-export function describeHeldAction({ code, tool, input }) {
+export function describeHeldAction({ code, tool, input, reason = 'document' }) {
   const chainId = input.chainId ?? 8453;
   const chain = CHAIN_NAMES[Number(chainId)] ?? `chain ${chainId}`;
   const amount = formatAmount(input.amountInWeiPerRecipient, input.tokenContract, chainId);
@@ -191,14 +191,14 @@ export function describeHeldAction({ code, tool, input }) {
   return (
     (MCP_CONFIRM_TOOLS.has(tool)
       ? `⏸️ Needs your confirmation — changes to your trust graph never run automatically.\n`
-      : `⏸️ Held for confirmation — a document is in this conversation, so transfers don't run automatically.\n`) +
+      : `⏸️ Held for confirmation — ${HOLD_REASONS[reason] ?? HOLD_REASONS.document}.\n`) +
     lines.join('\n') +
     `\nSend /confirm ${code} to run it, or /cancel ${code}. Expires in ${Math.round(HOLD_TTL_MS / 60000)} min.`
   );
 }
 
 /** What the model sees instead of a transfer result. */
-export function heldToolResult(code, tool = null) {
+export function heldToolResult(code, tool = null, reason = 'document') {
   if (MCP_CONFIRM_TOOLS.has(tool)) {
     return JSON.stringify({
       status: 'held_for_confirmation',
@@ -215,7 +215,7 @@ export function heldToolResult(code, tool = null) {
     executed: false,
     code,
     message:
-      'NOT sent. A document is in this conversation, so this transfer is held until the user confirms. ' +
+      `NOT sent. Held until the user confirms: ${HOLD_REASONS[reason] ?? HOLD_REASONS.document}. ` +
       'The bot has already posted the details and the confirm command beneath your reply — do not repeat the code ' +
       'and do not say the transfer happened. Briefly tell the user it is waiting for their confirmation.',
   });
@@ -318,4 +318,51 @@ export function createVerifiedLinkStore({ maxPerContext = 20 } = {}) {
     list(contextId) { return [...(links.get(contextId) ?? [])]; },
     clear(contextId) { links.delete(contextId); },
   };
+}
+
+// ─── Send guardrail ──────────────────────────────────────────────────────────
+// Each user picks their own rule when they connect a key: no guardrail,
+// confirm every send, or confirm sends when their message quotes someone else.
+// Enforced here in code, never by the prompt — a rule the model holds is a rule
+// a quoted message can talk it out of. null = never chosen.
+
+export const SEND_GUARDS = ['none', 'all', 'quotes'];
+
+const HOLD_REASONS = {
+  document: "a document is in this conversation, so transfers don't run automatically",
+  guard_all: 'you asked to confirm every send',
+  guard_quotes: "your message quotes someone else's, and you asked to confirm sends in that case",
+};
+
+/** Map a user's reply to a guard value, or null if it isn't one. */
+export function parseSendGuard(text) {
+  const t = String(text ?? '').trim().toLowerCase();
+  if (['none', 'off', 'no'].includes(t)) return 'none';
+  if (['all', 'every', 'always', 'on'].includes(t)) return 'all';
+  if (['quotes', 'quote', 'quoted', 'replies', 'reply'].includes(t)) return 'quotes';
+  return null;
+}
+
+/**
+ * Why a money call must wait for confirmation, or null to run it now.
+ * A document in context always holds, whatever the user chose.
+ */
+export function holdReason({ tool, confirmed = false, documentInContext = false, quotesOther = false, guard = null }) {
+  if (confirmed || !MONEY_TOOLS.has(tool)) return null;
+  if (documentInContext) return 'document';
+  if (guard === 'all') return 'guard_all';
+  if (guard === 'quotes' && quotesOther) return 'guard_quotes';
+  return null;
+}
+
+/** The setup question. `cmd` is '/' on Telegram, '!' on Discord. */
+export function sendGuardPrompt(cmd, current = null) {
+  const now = current ? `Current setting: ${current}.\n\n` : '';
+  return (
+    `🛡️ ${now}Do you want a guardrail on sends? Pick one:\n` +
+    `• ${cmd}guard none — sends run as soon as you ask\n` +
+    `• ${cmd}guard all — every send waits for your ${cmd}confirm\n` +
+    `• ${cmd}guard quotes — sends wait for ${cmd}confirm only when your message quotes someone else's (e.g. you reply to them and tag me)\n\n` +
+    `A document in the chat always makes sends wait, whatever you pick. Change it anytime with ${cmd}guard.`
+  );
 }

@@ -20,7 +20,7 @@ import {
   historyHasDocument, createDocumentTaint, DOC_MARKER, PDF_MAX_BYTES,
 } from '../documents.js';
 import {
-  MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, formatAmount,
+  MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, formatAmount, holdReason, sendGuardPrompt,
   parseConfirmPayload, formatOutcomeRecord, createRecordQueue, neutraliseBotRecords,
   createVerifiedLinkStore, BOT_RECORD_MARKER,
 } from '../held-actions.js';
@@ -193,6 +193,10 @@ function buildRunTool() {
     executeConditionalDrop: () => {},
     createPendingClaim: () => { calls.push({ tool: 'claim' }); return { id: 'c1', expiresAt: 0, link: 'https://t.me/bot?start=claim_c1' }; },
     tg: { telegram: { sendMessage: async () => {} } },
+    holdReason, sendGuardPrompt,
+    guards: {}, asked: new Set(),
+    getSendGuard: (id) => deps.guards[String(id)] ?? null,
+    claimSendGuardQuestion: (id) => (deps.asked.has(String(id)) ? false : (deps.asked.add(String(id)), true)),
   };
   const runTool = new Function(...Object.keys(deps), `${fnSrc('runTool')}\nreturn runTool;`)(...Object.values(deps));
   return { runTool, calls, deps };
@@ -342,7 +346,7 @@ test('handler wiring', () => {
   const h = fnSrc('handleChatMessage');
   assert.match(h, /const documentInContext = documentTaint\.isTainted\(contextId\) \|\| historyHasDocument\(/);
   assert.match(h, /if \(docBlock\) documentTaint\.mark\(contextId\);\n\s*const historyKey/);
-  assert.match(h, /contextId,\n\s*documentInContext,\n\s*heldNotices,/, 'gate inputs reach runTool');
+  assert.match(h, /contextId,\n\s*documentInContext,\n\s*quotesOther,\n\s*heldNotices,/, 'gate inputs reach runTool');
   assert.match(h, /await editor\.finalize\(finalText\);\n\s*documentTaint\.tick\(contextId\);/);
   assert.match(h, /sanitizeUnverifiedTxClaims\(finalText, \[\.\.\._pendingExplorerUrls, \.\.\.verifiedTxLinks\.list\(contextId\)\]\)/);
   assert.match(h, /heldOutcomeRecords\.take\(contextId\)/);

@@ -24,6 +24,7 @@ import {
 } from './documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmPayload, parseInlineConfirm,
+  holdReason, parseSendGuard, sendGuardPrompt,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 import { formatReplyContext } from './reply-context.js';
@@ -411,6 +412,29 @@ function setUserApiKey(telegramId, apiKey) {
     .run(String(telegramId), encrypt(apiKey));
 }
 
+// Send guardrail — the user's own choice, asked at /connect (or on the first
+// send for keys connected before this existed). See holdReason in held-actions.js.
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN send_guard TEXT`); } catch { }
+try { db.exec(`ALTER TABLE user_keys ADD COLUMN send_guard_asked INTEGER`); } catch { }
+
+function getSendGuard(telegramId) {
+  return db.prepare('SELECT send_guard FROM user_keys WHERE telegram_id = ?').get(String(telegramId))?.send_guard ?? null;
+}
+
+function setSendGuard(telegramId, guard) {
+  db.prepare(`INSERT INTO user_keys (telegram_id, send_guard, send_guard_asked) VALUES (?, ?, unixepoch())
+    ON CONFLICT(telegram_id) DO UPDATE SET send_guard = excluded.send_guard, send_guard_asked = excluded.send_guard_asked`)
+    .run(String(telegramId), guard);
+}
+
+/** True the first time only — the caller then shows the question once. */
+function claimSendGuardQuestion(telegramId) {
+  const r = db.prepare(`INSERT INTO user_keys (telegram_id, send_guard_asked) VALUES (?, unixepoch())
+    ON CONFLICT(telegram_id) DO UPDATE SET send_guard_asked = unixepoch() WHERE send_guard_asked IS NULL`)
+    .run(String(telegramId));
+  return r.changes > 0;
+}
+
 function deleteUserApiKey(telegramId) {
   db.prepare('UPDATE user_keys SET api_key = \'\' WHERE telegram_id = ?').run(String(telegramId));
 }
@@ -546,7 +570,7 @@ function normalizeAgentName(raw) {
 // Commands the bot already owns — an agent named `minds` would shadow /minds.
 const RESERVED_AGENT_NAMES = new Set([
   'agent', 'agents', 'minds', 'minds_remove', 'llm', 'llm_remove',
-  'connect', 'revoke', 'start', 'help', 'confirm', 'cancel', 'bankr', 'bankr_remove',
+  'connect', 'revoke', 'start', 'help', 'confirm', 'cancel', 'guard', 'bankr', 'bankr_remove',
 ]);
 
 // The host key for a provider, or null if the host hasn't configured one.
@@ -692,6 +716,7 @@ const BASE_COMMANDS = [
   { command: 'agent', description: 'Create or manage an agent' },
   { command: 'connect', description: 'Link your Quidli API key' },
   { command: 'revoke', description: 'Remove your Quidli API key' },
+  { command: 'guard', description: 'Choose when sends wait for /confirm' },
   { command: 'bankr', description: 'Link your Bankr API key' },
   { command: 'bankr_remove', description: 'Remove your Bankr API key' },
   { command: 'llm', description: 'Use your own LLM key' },
@@ -1389,7 +1414,7 @@ function trackedRunTool(name, input, ctx) {
 
 async function runTool(name, input, {
   senderId, senderApiKey, currentChatId, isPrivateChat, contextId = null,
-  documentInContext = false, confirmed = false, heldNotices = null,
+  documentInContext = false, quotesOther = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
   if (shutdown.stopping && (MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name))) {
@@ -1400,7 +1425,9 @@ async function runTool(name, input, {
   // With a document in context, money-committing calls are parked, not run.
   // A sender with no usable key falls through: those branches refuse without
   // moving anything, and holding a transfer that can't run helps nobody.
-  if (MONEY_TOOLS.has(name) && documentInContext && !confirmed) {
+  const guard = MONEY_TOOLS.has(name) && !confirmed ? getSendGuard(senderId) : null;
+  const holdWhy = holdReason({ tool: name, confirmed, documentInContext, quotesOther, guard });
+  if (holdWhy) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     const hasKey = name === 'bankr_agent' ? !!getUserBankrKey(senderId)
       : name === 'bankr_swap_and_drop' ? !!getUserBankrKey(senderId) && !!senderApiKey
@@ -1408,13 +1435,20 @@ async function runTool(name, input, {
     if (hasKey || isOwner) {
       const held = heldActions.hold({
         tool: name, input, senderId: String(senderId), channelId: currentChatId,
-        contextId: contextId ?? String(currentChatId), isPrivateChat,
+        contextId: contextId ?? String(currentChatId), isPrivateChat, reason: holdWhy,
       });
       if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
-      console.log(`[held] ${name} code=${held.code} sender=${senderId}`);
-      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
-      return heldToolResult(held.code);
+      console.log(`[held] ${name} code=${held.code} sender=${senderId} reason=${holdWhy}`);
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input, reason: holdWhy }));
+      return heldToolResult(held.code, null, holdWhy);
     }
+  }
+
+  // Keys connected before the guardrail existed were never asked. Ask once,
+  // on their first send; this send runs as it always has.
+  const canSend = !!senderApiKey || (BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID));
+  if (MONEY_TOOLS.has(name) && !confirmed && guard === null && canSend && claimSendGuardQuestion(senderId)) {
+    heldNotices?.push(sendGuardPrompt('/'));
   }
 
   // ── Confirm gate for Connect write tools ────────────────────────────────────
@@ -2292,11 +2326,31 @@ tg.command('connect', async (ctx) => {
   }
   setUserApiKey(ctx.from.id, apiKey);
   const scrubbed = await scrubCredentialMessage(ctx);
-  ctx.reply(
+  // Awaited so the guardrail question below arrives after this, not before.
+  await ctx.reply(
     '✅ Connected! Drops will now use your Smart Send wallet.\n\n' +
     '⚠️ Your API key is stored encrypted and only has access to your Smart Send balance — not your main wallet. ' +
     'DM /revoke anytime to disconnect.' + scrubNote(scrubbed)
-  );
+  ).catch(() => {});
+  // First setup: ask once. Someone reconnecting keeps what they chose.
+  const guard = getSendGuard(ctx.from.id);
+  if (!guard) {
+    claimSendGuardQuestion(ctx.from.id);
+    ctx.reply(sendGuardPrompt('/')).catch(() => {});
+  }
+});
+
+tg.command('guard', async (ctx) => {
+  const arg = ctx.message.text.replace(/^\/guard(@\S+)?/i, '').trim();
+  const choice = parseSendGuard(arg);
+  if (!choice) return ctx.reply(sendGuardPrompt('/', getSendGuard(ctx.from.id))).catch(() => {});
+  setSendGuard(ctx.from.id, choice);
+  const said = {
+    none: '✅ No guardrail — sends run as soon as you ask.',
+    all: '✅ Every send now waits for your /confirm.',
+    quotes: '✅ Sends now wait for /confirm when your message quotes someone else.',
+  }[choice];
+  return ctx.reply(`${said} A document in the chat still makes sends wait.`).catch(() => {});
 });
 
 tg.command('revoke', async (ctx) => {
@@ -3146,6 +3200,10 @@ async function handleChatMessage(ctx) {
   // can steer this turn, directly or through an agent reply in the digest.
   if (docBlock) documentTaint.mark(contextId);
   const historyKey = agent ? agentContextId(contextId, agent.agent_name) : contextId;
+  // Someone else's text in this turn: a reply block, or an agent turn's quote.
+  // Only the user's own /guard quotes setting makes this hold a send.
+  const quotesOther = !!replyContext || (!!agent && msg.reply_to_message?.from?.id !== tg.botInfo?.id
+    && !!(msg.reply_to_message?.text ?? msg.reply_to_message?.caption));
   const documentInContext = documentTaint.isTainted(contextId) || historyHasDocument(
     anthropicHistories.get(historyKey), geminiHistories.get(historyKey), openaiHistories.get(historyKey),
   );
@@ -3158,6 +3216,7 @@ async function handleChatMessage(ctx) {
     isPrivateChat: isPrivate,
     contextId,
     documentInContext,
+    quotesOther,
     heldNotices,
   };
 
