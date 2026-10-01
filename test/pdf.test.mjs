@@ -21,6 +21,7 @@ import {
 } from '../documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, formatAmount, holdReason, sendGuardPrompt,
+  TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
   parseConfirmPayload, formatOutcomeRecord, createRecordQueue, neutraliseBotRecords,
   createVerifiedLinkStore, BOT_RECORD_MARKER,
 } from '../held-actions.js';
@@ -193,7 +194,7 @@ function buildRunTool() {
     executeConditionalDrop: () => {},
     createPendingClaim: () => { calls.push({ tool: 'claim' }); return { id: 'c1', expiresAt: 0, link: 'https://t.me/bot?start=claim_c1' }; },
     tg: { telegram: { sendMessage: async () => {} } },
-    holdReason, sendGuardPrompt,
+    holdReason, sendGuardPrompt, TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
     guards: {}, asked: new Set(),
     getSendGuard: (id) => deps.guards[String(id)] ?? null,
     claimSendGuardQuestion: (id) => (deps.asked.has(String(id)) ? false : (deps.asked.add(String(id)), true)),
@@ -260,7 +261,7 @@ function buildConfirm(runToolImpl) {
     heldOutcomeRecords: createRecordQueue(),
     verifiedTxLinks: createVerifiedLinkStore(),
     describeHeldAction, formatOutcomeRecord, parseConfirmPayload,
-    MCP_CONFIRM_TOOLS,
+    MCP_CONFIRM_TOOLS, TRUST_BATCH_TOOL,
     getUserApiKey: () => 'k',
     _pendingExplorerUrls: [],
     runTool: runToolImpl,

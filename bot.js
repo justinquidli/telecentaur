@@ -24,7 +24,7 @@ import {
 } from './documents.js';
 import {
   MONEY_TOOLS, createHeldActionStore, describeHeldAction, heldToolResult, parseConfirmPayload, parseInlineConfirm,
-  holdReason, parseSendGuard, sendGuardPrompt,
+  holdReason, parseSendGuard, sendGuardPrompt, TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
   formatOutcomeRecord, createRecordQueue, neutraliseBotRecords, createVerifiedLinkStore,
 } from './held-actions.js';
 import { formatReplyContext } from './reply-context.js';
@@ -174,6 +174,9 @@ Then synthesize everything into a warm, conversational paragraph: who they are p
 
 ## Resolving Telegram mentions
 Every message includes context like: "@username (Telegram ID: 123456789)". Always extract and use the Telegram ID when available — it's more reliable than usernames. If only a username is available, use connect_lookup_exposed to resolve it first.
+
+## Trusting several people (trust_many)
+When the user wants to trust more than one person — a list, a team, "everyone here" — call trust_many ONCE with all of them, not connect_trust_create per person. It is held for a single /confirm. For "everyone in this chat", call telegram_get_chat_members first and use their Telegram IDs; leave out the requester. Suggest a context label (e.g. "team:<name>") so the group can be checked later, but use what the user says.
 
 ## Checking personal trust (connect_trust_check)
 When someone asks whether a person is who they claim to be, whether they know or trust them, or "is this my co-founder / teammate / etc.", check the asker's own trust graph with connect_trust_check: from = the asker (type telegram, their Telegram ID), targets = the person in question (type telegram, their Telegram ID). This is the answer to "do I trust them", not a reputation score.
@@ -1290,6 +1293,32 @@ const tools = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: TRUST_BATCH_TOOL,
+    description: `Trust several people at once — a list, a group, "everyone here" — behind ONE confirmation. Use this instead of calling connect_trust_create once per person whenever more than one person is involved. Each person still gets their own onchain attestation on Base. The user confirms the whole list with a single /confirm code; nothing is written before that. At most ${TRUST_BATCH_MAX} people per call. For "everyone in this chat", get the list with telegram_get_chat_members first and use each member's Telegram ID.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        targets: {
+          type: 'array',
+          description: 'The people to trust. Prefer numeric IDs ({ "type": "telegram", "id": "123" }) over usernames.',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['email', 'phone', 'telegram', 'discord', 'farcaster', 'twitter', 'github', 'linkedin', 'slack', 'wallet', 'username'] },
+              id: { type: 'string' },
+              username: { type: 'string' },
+            },
+            required: ['type'],
+          },
+        },
+        level: { type: 'integer', minimum: 1, maximum: 100, description: 'Trust level 1–100, applied to everyone in the list.' },
+        context: { type: 'string', maxLength: 64, description: 'Optional label for this group, e.g. "team:quidli". Lets a later check ask about this group specifically.' },
+        expiresIn: { type: 'integer', description: 'Optional lifetime in seconds.' },
+      },
+      required: ['targets', 'level'],
+    },
+  },
+  {
     name: 'resolve_telegram_username',
     description: 'Resolve a Telegram @username to its numeric Telegram ID by checking every group chat this bot has ever seen them post in. ALWAYS try this BEFORE calling connect_lookup/connect_drop with a raw Telegram username, since Telegram itself does not let Quidli resolve arbitrary usernames — only numeric IDs work reliably. If this returns a numeric ID, use { type: "telegram", id: "<id>" } for connect_lookup and connect_drop instead of username. If it returns nothing, the bot has never seen that user active anywhere, and you should tell the requester to ask them to DM this bot directly (any message, even just "hi") — after they do, this will resolve them.',
     input_schema: {
@@ -1411,7 +1440,7 @@ function sanitizeUnverifiedTxClaims(text, realUrls) {
 // agent move funds without going through quidliDrop.
 function trackedRunTool(name, input, ctx) {
   const p = runTool(name, input, ctx);
-  return MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name) ? shutdown.track(p, name) : p;
+  return MONEY_TOOLS.has(name) || isTrustAction(name) ? shutdown.track(p, name) : p;
 }
 
 async function runTool(name, input, {
@@ -1419,7 +1448,7 @@ async function runTool(name, input, {
   documentInContext = false, quotesOther = false, confirmed = false, heldNotices = null,
 } = {}) {
   console.log(`[tool] ${name}`, JSON.stringify(input).slice(0, 120));
-  if (shutdown.stopping && (MONEY_TOOLS.has(name) || MCP_CONFIRM_TOOLS.has(name))) {
+  if (shutdown.stopping && (MONEY_TOOLS.has(name) || isTrustAction(name))) {
     return JSON.stringify({ status: 'refused', executed: false, error: 'The bot is restarting. Nothing was sent or changed — tell the user to ask again in a minute.' });
   }
 
@@ -1458,6 +1487,55 @@ async function runTool(name, input, {
   // wallet. They always wait for /confirm, document or not: in a group chat another
   // member's message can steer the model as easily as a PDF can. With no usable
   // key we fall through — the call 401s and nothing is written.
+  // ── Trust several people behind one confirmation ────────────────────────────
+  if (name === TRUST_BATCH_TOOL) {
+    const invalid = validateTrustBatch(input);
+    if (invalid) return JSON.stringify({ status: 'refused', executed: false, error: invalid });
+    if (!mcpToolNames.has('connect_trust_create')) {
+      return JSON.stringify({ status: 'refused', executed: false, error: 'Trust attestations are not available from Connect right now. Nothing was written.' });
+    }
+    const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
+    const keyToUse = senderApiKey || (isOwner ? QUIDLI_API_KEY : null);
+    if (!keyToUse) return 'Error: this needs your own Quidli key. Tell the user, in your own words: get a key at connect.quid.li, then DM me /connect <your-key> to link it.';
+    if (!confirmed) {
+      const held = heldActions.hold({
+        tool: name, input, senderId: String(senderId), channelId: currentChatId,
+        contextId: contextId ?? String(currentChatId), isPrivateChat,
+      });
+      if (held.error) return JSON.stringify({ status: 'refused', executed: false, error: held.error });
+      console.log(`[held] ${name} code=${held.code} sender=${senderId} targets=${input.targets.length}`);
+      heldNotices?.push(describeHeldAction({ code: held.code, tool: name, input }));
+      return heldToolResult(held.code, name);
+    }
+    // Confirmed: one attestation per person, one at a time, so a failure part
+    // way through leaves a clear record of who was and wasn't trusted.
+    const results = [];
+    for (const to of input.targets) {
+      try {
+        const out = String(await mcpCallTool('connect_trust_create', {
+          to, level: Number(input.level),
+          ...(input.context ? { context: String(input.context) } : {}),
+          ...(input.expiresIn ? { expiresIn: Number(input.expiresIn) } : {}),
+        }, keyToUse));
+        const status = Number(out.match(/"httpStatus":\s*(\d+)/)?.[1] ?? 200);
+        results.push(status < 400 ? { to, ok: true } : { to, ok: false, error: out.slice(0, 200) });
+      } catch (err) {
+        results.push({ to, ok: false, error: String(err?.message ?? err).slice(0, 200) });
+      }
+    }
+    const ok = results.filter((r) => r.ok);
+    const failed = results.filter((r) => !r.ok);
+    const who = (t) => `${t.type}:${t.id ?? t.username}`;
+    console.log(`[trust_many] ${ok.length}/${results.length} ok sender=${senderId}`);
+    return JSON.stringify({
+      success: failed.length === 0,
+      trusted: ok.length,
+      total: results.length,
+      failed: failed.map((r) => ({ to: who(r.to), error: r.error })),
+      message: `Trusted ${ok.length} of ${results.length}` + (failed.length ? `. Failed: ${failed.map((r) => who(r.to)).join(', ')}` : '.'),
+    });
+  }
+
   if (MCP_CONFIRM_TOOLS.has(name) && mcpToolNames.has(name) && !confirmed) {
     const isOwner = BOT_OWNER_ID && String(senderId) === String(BOT_OWNER_ID);
     if (senderApiKey || isOwner) {
@@ -2802,14 +2880,18 @@ async function handleConfirmCommand(ctx, verb, payload = ctx.payload) {
   // Connect write tools return the server's own text; runTool throws on an MCP
   // error and returns an 'Error: …' string when the key is missing.
   const isConnectWrite = MCP_CONFIRM_TOOLS.has(action.tool);
-  const succeeded = isConnectWrite ? !String(raw ?? '').startsWith('Error:')
+  const succeeded = action.tool === TRUST_BATCH_TOOL ? !!result.success
+    : isConnectWrite ? !String(raw ?? '').startsWith('Error:')
     : action.tool === 'connect_drop' ? !!result.transferHash
     : action.tool === 'bankr_agent' || action.tool === 'bankr_swap_and_drop' ? result.status === 'completed'
     : (!!result.success && !result.error);
   if (succeeded && result.explorerUrl) verifiedTxLinks.add(action.contextId, result.explorerUrl);
   if (action.tool === 'bankr_agent') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
   if (action.tool === 'bankr_swap_and_drop') for (const u of result.explorerUrls ?? []) verifiedTxLinks.add(action.contextId, u);
-  if ((action.tool === 'bankr_agent' && result.status === 'still_running') || (action.tool === 'bankr_swap_and_drop' && ['partial', 'unknown'].includes(result.status))) {
+  if (action.tool === TRUST_BATCH_TOOL && !result.success && result.trusted > 0) {
+    // Some went through: that is neither a clean success nor a failure.
+    heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'executed', `partially: ${result.message}`));
+  } else if ((action.tool === 'bankr_agent' && result.status === 'still_running') || (action.tool === 'bankr_swap_and_drop' && ['partial', 'unknown'].includes(result.status))) {
     heldOutcomeRecords.push(action.contextId, formatOutcomeRecord(action, 'unknown', result.message ?? `Bankr job ${result.jobId} still running`));
   } else heldOutcomeRecords.push(action.contextId, succeeded
     ? formatOutcomeRecord(action, 'executed',
@@ -2820,7 +2902,13 @@ async function handleConfirmCommand(ctx, verb, payload = ctx.payload) {
       result.explorerUrl)
     : formatOutcomeRecord(action, 'failed', result.error ?? result.message ?? (isConnectWrite ? String(raw ?? '') : '')));
 
-  if (action.tool === 'bankr_swap_and_drop') {
+  if (action.tool === TRUST_BATCH_TOOL) {
+    const icon = result.success ? '✅' : result.trusted > 0 ? '⚠️' : '❌';
+    const fails = (result.failed ?? []).map((f) => `\n• ${f.to}: ${String(f.error ?? '').slice(0, 120)}`).join('');
+    await say(result.total != null
+      ? `${icon} ${action.code}: ${result.message}${fails}`
+      : `❌ ${action.code} did not go through: ${String(result.error ?? raw).slice(0, 300)}`);
+  } else if (action.tool === 'bankr_swap_and_drop') {
     const links = (result.explorerUrls ?? []).map((u) => `\n🔗 ${u}`).join('');
     const icon = { completed: '✅', partial: '⚠️', unknown: '⚠️' }[result.status] ?? '❌';
     await say(`${icon} ${action.code}: ${String(result.message ?? raw).slice(0, 1200)}${links}`);

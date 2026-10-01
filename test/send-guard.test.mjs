@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { holdReason, parseSendGuard, sendGuardPrompt, describeHeldAction, heldToolResult, createHeldActionStore } from '../held-actions.js';
+import { holdReason, parseSendGuard, sendGuardPrompt, describeHeldAction, heldToolResult, createHeldActionStore, TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction } from '../held-actions.js';
 
 const send = { tool: 'connect_drop' };
 
@@ -96,7 +96,7 @@ function buildRunTool() {
     mcpCallTool: async (name) => { calls.push(name); return '{"httpStatus":201,"transferHash":"0xabc"}'; },
     mcpFailureReason: () => null, redactConnectMe: (t) => t, _pendingExplorerUrls: [],
     getUserBankrKey: () => null,
-    holdReason, sendGuardPrompt,
+    holdReason, sendGuardPrompt, TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
     guards: {}, asked: new Set(),
     getSendGuard: (id) => deps.guards[String(id)] ?? null,
     claimSendGuardQuestion: (id) => (deps.asked.has(String(id)) ? false : (deps.asked.add(String(id)), true)),
