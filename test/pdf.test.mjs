@@ -517,3 +517,17 @@ test('connect_drop gets a new key on every call, and a 202 is retried with the s
   assert.notEqual(seen[2], seen[0], 'a new call gets a new key, even when the model repeats its own');
   assert.ok(!seen.includes('f47ac10b-58cc-4372-a567-0e02b2c3d479'));
 });
+
+// ─── the sanitizer is host-agnostic: no chain's explorer is a free pass ──────
+
+test('invented tx links are stripped on every explorer host, real ones kept', () => {
+  const sanitize = new Function(`${SRC.match(/^const EXPLORER_TX_RE = .*;$/m)[0]}\n${fnSrc('sanitizeUnverifiedTxClaims')}\nreturn sanitizeUnverifiedTxClaims;`)();
+  const hash = '0x' + 'ab'.repeat(32);
+  for (const host of ['explorer.monad.xyz', 'monadscan.com', 'worldscan.org', 'explorer.chain.robinhood.com', 'basescan.org']) {
+    const url = `https://${host}/tx/${hash}`;
+    assert.match(sanitize(`Explorer link: [View](${url})`, []), /unverified transaction link removed/, host);
+    assert.match(sanitize(`sent ${url}.`, []), /unverified transaction link removed/, host);
+    assert.equal(sanitize(`sent ${url}`, [url]), `sent ${url}`, `${host} real link kept`);
+  }
+  assert.match(sanitize('https://explorer.monad.xyz/tx/0xabc123...', []), /unverified transaction link removed/);
+});
