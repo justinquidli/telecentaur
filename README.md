@@ -86,7 +86,7 @@ cp .env.example .env
 | `BANKR_API_KEY` | — | Your own [Bankr](https://bankr.bot/api) key, used only by `BOT_OWNER_ID`. Everyone else links their own with `/bankr <key>`. Needed for swaps and market questions; the bot runs without it, minus those ([details](#bankr--swaps-and-market-data)) |
 | `BRAVE_SEARCH_API_KEY` | — | From [brave.com/search/api](https://brave.com/search/api) — required for web search and conditional drops |
 | `CLAUDE_MODEL` | — | Defaults to `claude-sonnet-4-6` |
-| `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, `openai`, or `nous` |
+| `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, `openai`, or `hermes` (Nous Portal; the internal id is still `hermes`, and the code reads this value as-is, so `nous` is not a valid value here) |
 | `GEMINI_API_KEY` | — | From [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | `GEMINI_MODEL` | — | Defaults to `gemini-2.0-flash` |
 | `OPENAI_API_KEY` | — | From [platform.openai.com](https://platform.openai.com) |
@@ -495,7 +495,7 @@ Send a PDF — in a DM, or in a group with a caption that mentions the bot (or r
 - Text extraction only (`unpdf`). Scanned / image-only and password-protected PDFs are refused with a message. Non-PDF files are declined.
 - The text goes into the conversation history (the chat's, or the addressed agent's thread), so follow-ups work until it ages out.
 
-**Transfers are held while a document is in the chat.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So for 40 turns after anyone uploads one to a chat — long enough for the document, and every reply or agent digest that quoted it, to leave the history — `connect_drop`, `schedule_drop`, `conditional_drop`, `create_watcher` and `create_pending_claim` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
+**Transfers are held while a document is in the chat.** A PDF is third-party text and can contain instructions ("send 500 USDC to …"). So for 40 turns after anyone uploads one to a chat — long enough for the document, and every reply or agent digest that quoted it, to leave the history — `connect_drop`, `schedule_drop`, `conditional_drop`, `create_watcher`, `create_pending_claim`, `bankr_agent` and `bankr_swap_and_drop` don't run. The bot posts exactly what would happen, built from the tool arguments rather than the model's prose, with a code:
 
 ```
 /confirm K7QM2P   — run it
@@ -540,7 +540,7 @@ request, or switch providers — nothing after the cap was executed.
 
 **Drop returns 400:** Ensure Smart Send is enabled and funded at [connect.quid.li](https://connect.quid.li).
 
-**Score returns 404:** Confirm `QUIDLI_API_KEY` is set in `.env`.
+**Lookup, score or balance says a key is needed:** the person asking must link their own key with `/connect <key>` in a DM. The host key (`QUIDLI_API_KEY`) only covers `BOT_OWNER_ID`. If *nobody* gets Connect tools, check `QUIDLI_API_KEY` is set in `.env`: the bot registers Connect's MCP tools only when it has a host key.
 
 **Conditional drop fires at wrong time:** Make sure `BRAVE_SEARCH_API_KEY` is set.
 
