@@ -123,10 +123,10 @@ pm2 save
 npm run check     # syntax check + tests
 ```
 
-32 tests. They cover agent name slugging, addressing, key resolution, switch precedence, the
-Minds migration, the group ownership rules, `connect_me` redaction, and the MCP tool gate
+`npm test` prints the current count (160+ at the time of writing; don't trust a number written here). The suite covers agent name slugging, addressing, key resolution, switch precedence, the
+Minds migration, the group ownership rules, `connect_me` redaction, the MCP tool gate
 (read-only registration, fail-closed on unannotated tools, the legacy fallback, and the
-keyless header), per-chain explorer links and the fabricated-transaction-link guard. Every case corresponds to a bug that shipped or nearly shipped. `bot.js` connects to Telegram on import,
+keyless header), per-chain explorer links, the host-agnostic fabricated-transaction-link guard, held transfers and the send guardrail, reply context, and group trust. Every case corresponds to a bug that shipped or nearly shipped. `bot.js` connects to Telegram on import,
 so the tests extract the functions under test from its source rather than importing it —
 a stopgap until it's split into modules.
 
