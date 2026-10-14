@@ -13,7 +13,7 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos)
 - **Check who you trust** — reply to someone and ask "is this my co-founder?"; the bot checks your onchain trust graph by their account ID, not their display name ([details](#replying-to-a-message))
 - **Send guardrail** — you choose whether sends wait for `/confirm`: never, always, or when you're replying to someone ([details](#send-guardrail))
-- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails
+- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails. Token coverage depends on Connect: on Monad and Robinhood Chain only the native balance is returned today, so a missing token there does not mean zero
 - **Schedule drops** — send tokens at a future time, surviving bot restarts
 - **Conditional drops** — "if BTC is above $100k, send 1 USDC to @alice" — evaluated automatically using real-time web search
 - **Channel watchers** — send tokens to the first person who types a trigger phrase in a group
@@ -30,9 +30,8 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 ```
 Telegram message → the chat's model, or a named agent you addressed as /name
                → Claude / Gemini / OpenAI / OpenRouter / Nous Portal / your Mind / your own endpoint
-               → Quidli Connect, over two paths:
-                   • MCP  — lookup / exposed / scores / balance / profile (discovered at runtime)
-                   • REST — drop (the only hand-written Connect call left)
+               → Quidli Connect's MCP — lookup / exposed / scores / balance / profile / trust / drop
+                 (tools discovered at runtime; no hand-written Connect calls remain)
                → edit Telegram reply in real time
 ```
 
@@ -89,7 +88,7 @@ cp .env.example .env
 | `CLAUDE_MODEL` | — | Defaults to `claude-sonnet-4-6` |
 | `DEFAULT_LLM_PROVIDER` | — | `anthropic` (default), `gemini`, `openai`, or `nous` |
 | `GEMINI_API_KEY` | — | From [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| `GEMINI_MODEL` | — | Defaults to `gemini-2.5-flash` |
+| `GEMINI_MODEL` | — | Defaults to `gemini-2.0-flash` |
 | `OPENAI_API_KEY` | — | From [platform.openai.com](https://platform.openai.com) |
 | `OPENAI_MODEL` | — | Defaults to `gpt-4o` |
 | `NOUS_API_KEY` | — | From [portal.nousresearch.com](https://portal.nousresearch.com) — one key, 200+ models |
@@ -292,8 +291,9 @@ Point it elsewhere with `CONNECT_MCP_URL` (defaults to `https://mcp.connect.quid
 
 Note on chains: drops are **multi-chain**. Base (8453) is the default and what the model uses
 unless the user names another, but Ethereum (1), Optimism (10), Polygon (137), Arbitrum (42161),
-Avalanche (43114), Monad (143), Robinhood Chain (4663) and Solana (1399811149) all work. World Chain (480)
-is also listed by Connect as drop-capable but has no explorer link here yet. `connect_get_chains` lets the
+Avalanche (43114) and Solana (1399811149) all work. Connect also lists Monad (143) and Robinhood Chain (4663)
+as drop-capable and the bot can build explorer links for them; sends on both have worked through Connect directly
+but have not been exercised through this bot. World Chain (480) is listed as drop-capable too but has no explorer link here yet. `connect_get_chains` lets the
 model answer chain questions from the server rather than guessing; the system prompt's own chain list is
 shorter than that, so the server is the source of truth.
 
