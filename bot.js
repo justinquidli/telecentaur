@@ -128,6 +128,7 @@ You are TeleCentaur, a Telegram bot that sends crypto tokens to people using Qui
 - Balances come back as balanceInWei with a decimals field — divide before showing a human number, and use the symbol from the response.
 - Before a drop that looks large, or after a drop fails for funding reasons, check the balance and say plainly what's short — the token or the gas.
 - Do NOT check balance before every routine drop; it's an extra call and most drops are fine.
+- In a group chat, never state how much anyone holds — not a balance, not what's left after a send (leftInConnect included). Say only whether it covers the send ("You've got enough for that"). If they ask for their balance in a group, tell them to DM you for it.
 
 ## Sending tokens (connect_drop)
 - Pass people straight to connect_drop as recipients — Connect resolves them to the right wallet for the chain and creates one if they don't have one yet. You don't need connect_lookup first. If the result still says "processing", Connect is setting up the recipient's wallet and nothing was sent: tell the user to ask again in a minute.
@@ -227,7 +228,7 @@ Use conditional_drop when a drop depends on a real-world outcome ("if X wins", "
 ALWAYS use web_search first to find the event's scheduled end time in UTC. Pass that time as checkAt (ISO 8601 UTC string, e.g. "2026-06-27T22:30:00Z") with a 30-minute buffer after the expected end. Never guess — search for the exact UTC time.
 
 ## Sending to everyone in a group (telegram_get_chat_members)
-When someone says "send to everyone", "send to all members", "send to the whole group", or similar, call telegram_get_chat_members first to get the list of known chat members, then pass all returned members as recipients (using their telegramId with { type: "telegram", id: "<telegramId>" }). Exclude the requester from the recipient list (already done by the tool). If the list is empty, tell the user no other members have been seen in this chat yet.
+When someone says "send to everyone", "send to all members", "send to the whole group", or similar, call telegram_get_chat_members first to get the list of known chat members, then pass all returned members as recipients (using their telegramId with { type: "telegram", id: "<telegramId>" }). Exclude the requester from the recipient list (already done by the tool). If the list is empty, tell the user no other members have been seen in this chat yet. If the result's unseenCount is above 0, send to the members you have, then say how many weren't included because they haven't posted since you joined, and that they can send any message and the requester can ask again.
 
 ## Channel watchers (create_watcher)
 Use create_watcher when asked to send tokens to whoever types a specific phrase. The watcher fires automatically when triggered.
@@ -1582,6 +1583,13 @@ async function runTool(name, input, {
         console.log('[drop] result:', JSON.stringify(body));
         return JSON.stringify({ ...body, explorerUrl }, null, 2);
       }
+      if (name === 'connect_drop_balance' && !isPrivateChat) {
+        return JSON.stringify({
+          groupChat: true,
+          instruction: 'Group chat: do not state any amount from this result. Say only whether it covers the send; for the actual balance, tell the user to DM you.',
+          result: mcpOut,
+        });
+      }
       return name === 'connect_me' ? redactConnectMe(mcpOut) : mcpOut;
     } catch (err) {
       if (keyToUse) throw err;
@@ -1727,10 +1735,20 @@ async function runTool(name, input, {
     const members = getChatMembers(currentChatId);
     // Exclude the requester themselves
     const others = members.filter((m) => m.user_id !== String(senderId));
+    // Telegram won't list a group's members to a bot, only count them. The
+    // count includes this bot (and any other bots), so unseen is a floor-at-0
+    // estimate of people the bot has never seen post (2026-10-26: a 4-person
+    // group paid 2 of 3 others with no hint that anyone was missing).
+    let totalMembers = null;
+    try { totalMembers = await tg.telegram.getChatMembersCount(currentChatId); } catch { }
+    const seen = new Set(members.map((m) => m.user_id)).add(String(senderId)).size;
+    const unseenCount = totalMembers == null ? null : Math.max(0, totalMembers - 1 - seen);
     return JSON.stringify({
       members: others.map((m) => ({ telegramId: m.user_id, username: m.username ?? null })),
       count: others.length,
-      note: 'These are members who have sent messages in this chat. Use their telegramId with { type: "telegram", id: "<telegramId>" } for drops.',
+      totalMembers,
+      unseenCount,
+      note: 'These are members who have sent messages in this chat. Use their telegramId with { type: "telegram", id: "<telegramId>" } for drops. unseenCount = members the bot has never seen post (other bots also count here), so they are not in this list.',
     }, null, 2);
   }
 
@@ -3526,6 +3544,14 @@ async function handleChatMessage(ctx) {
 
 tg.on(messageFilter('text'), handleChatMessage);
 tg.on(messageFilter('document'), handleChatMessage);
+
+// Joins arrive as service messages even with group privacy on, so a new
+// member counts for "send to everyone" before they ever post.
+tg.on(messageFilter('new_chat_members'), (ctx) => {
+  for (const u of ctx.message.new_chat_members ?? []) {
+    if (!u.is_bot) recordChatMember(ctx.chat.id, u.id, u.username ?? u.first_name ?? String(u.id));
+  }
+});
 
 // A throw in any handler used to stop polling for EVERY chat: Telegraf's
 // default handler rethrows, Promise.all in the polling loop rejects, launch()

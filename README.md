@@ -13,7 +13,7 @@ A Claude-powered Telegram bot with [Quidli Connect](https://connect.quid.li) int
 - **Check reputation scores** — get a composite web3 reputation score (Neynar, Lens, Ethos)
 - **Check who you trust** — reply to someone and ask "is this my co-founder?"; the bot checks your onchain trust graph by their account ID, not their display name ([details](#replying-to-a-message))
 - **Send guardrail** — you choose whether sends wait for `/confirm`: never, always, or when you're replying to someone ([details](#send-guardrail))
-- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails. Token coverage depends on Connect: on Monad and Robinhood Chain only the native balance is returned today, so a missing token there does not mean zero
+- **Check your balance** — native and ERC-20 balances for your Smart Send wallet, so the bot can tell you what's short before a drop fails. Token coverage depends on Connect: on Monad and Robinhood Chain only the native balance is returned today, so a missing token there does not mean zero. In a group it only says whether you can cover a send; ask in a DM for the amounts
 - **Schedule drops** — send tokens at a future time, surviving bot restarts
 - **Conditional drops** — "if BTC is above $100k, send 1 USDC to @alice" — evaluated automatically using real-time web search
 - **Channel watchers** — send tokens to the first person who types a trigger phrase in a group
@@ -67,7 +67,7 @@ In groups, @mention the bot or reply to it. In private chat, just message it dir
 1. Open Telegram and message [@BotFather](https://t.me/BotFather)
 2. Send `/newbot` and follow the prompts
 3. Copy the **HTTP API token** — this is your `TELEGRAM_TOKEN`
-4. *(Optional)* Send `/setprivacy` → select your bot → **Disable** to allow it to read all group messages (required for watchers)
+4. *(Optional)* Send `/setprivacy` → select your bot → **Disable** to allow it to read all group messages (required for watchers). "Send to everyone" only reaches people the bot has seen post or join; when some members are unseen it pays the rest and tells you how many were left out
 
 ### 2. Configure environment variables
 
