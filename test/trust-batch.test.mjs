@@ -10,7 +10,7 @@ import {
   TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
   createRecordQueue, createVerifiedLinkStore, formatOutcomeRecord, parseConfirmPayload,
 } from '../held-actions.js';
-import { MCP_CONFIRM_TOOLS } from '../connect-mcp.js';
+import { MCP_CONFIRM_TOOLS, formatToolRecord } from '../connect-mcp.js';
 
 const SRC = readFileSync(new URL('../bot.js', import.meta.url), 'utf8');
 function fnSrc(name) {
@@ -29,6 +29,7 @@ function buildRunTool({ mcp } = {}) {
     MCP_CONFIRM_TOOLS, shutdown: { stopping: false, track: (p) => p },
     mcpCallTool: mcp ?? (async (name, input, key) => { calls.push({ name, input, key }); return '{"httpStatus":201,"uid":"0x1"}'; }),
     mcpFailureReason: () => null, redactConnectMe: (t) => t, _pendingExplorerUrls: [],
+    formatToolRecord,
     explorerTxUrl: () => null, getUserBankrKey: () => null,
     holdReason, sendGuardPrompt, TRUST_BATCH_TOOL, TRUST_BATCH_MAX, validateTrustBatch, isTrustAction,
     getSendGuard: () => 'none', claimSendGuardQuestion: () => false,
